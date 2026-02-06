@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68.0", "setuptools-scm>=8.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "semdt-from-2d-video"
+version = "0.1.0"
+description = "Semantic Digital Twin construction from 2D video using VLM-based scene understanding"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "trimesh",
+    "requests",
+    "sqlalchemy",
+    "pyglet"
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff",
+    "pytest",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.ruff]
+line-length = 100
