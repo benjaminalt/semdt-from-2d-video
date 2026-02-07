@@ -23,6 +23,8 @@ from krrood.ormatic.dao import to_dao
 sys.path.insert(
     0, str(Path(__file__).parent.parent / "semantic_digital_twin" / "scripts")
 )
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+from hm3d_world_loader import HM3DWorldLoader
 
 DB_NAME = os.getenv("PGDATABASE")
 DB_USER = os.getenv("PGUSER")
@@ -260,18 +262,22 @@ def main(args):
     # Load world
     print(f"Loading world from {obj_dir}...")
 
-    world_loader = WarsawWorldLoader(obj_dir)
-    world = world_loader.world
-    bodies = world.bodies_with_enabled_collision
+    if args.dataset == "hm3d":
+        world_loader = HM3DWorldLoader(scene_dir=obj_dir)
+        world = world_loader.world
+        bodies = world_loader.object_bodies
+        camera_poses_dict = world_loader.compute_camera_poses()
+    else:
+        world_loader = WarsawWorldLoader(obj_dir)
+        world = world_loader.world
+        bodies = world.bodies_with_enabled_collision
+        camera_poses_dict = create_camera_poses()
 
     # Export semantic annotations JSON for VLM context
     world_loader.export_semantic_annotation_inheritance_structure(export_path)
 
     # Read taxonomy
     object_taxonomy = (export_path / "semantic_annotations.json").read_text()
-
-    # Create custom diagonal camera transforms (returns dict)
-    camera_poses_dict = create_camera_poses()
 
     if not args.skip_vlm and not args.render_only:
         # Render original scene from 3 viewpoints
@@ -358,10 +364,10 @@ def main(args):
 
         # Render original scene from 3 viewpoints
         print("Rendering original scene from 3 viewpoints...")
-        for idx, camera_pose in enumerate(camera_poses):
-            print(f"  Rendering {camera_names[idx]} view...")
+        for pose_name, camera_pose in camera_poses_dict.items():
+            print(f"  Rendering {pose_name} view...")
             world_loader.render_scene_from_camera_pose(
-                camera_pose, model_input_dir / f"scene_orig_{camera_names[idx]}.png"
+                camera_pose, model_input_dir / f"scene_orig_{pose_name}.png"
             )
 
         # Process groups
@@ -380,9 +386,9 @@ def main(args):
 
             # Render highlighted scene from 3 viewpoints
             print(f"  Rendering highlighted scene from 3 viewpoints...")
-            for idx, camera_pose in enumerate(camera_poses):
+            for pose_name, camera_pose in camera_poses_dict.items():
                 world_loader.render_scene_from_camera_pose(
-                    camera_pose, model_input_dir / f"scene_{i}_{camera_names[idx]}.png"
+                    camera_pose, model_input_dir / f"scene_{i}_{pose_name}.png"
                 )
 
             # Reset for next iteration
@@ -416,9 +422,17 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Query VLM for scene understanding")
     parser.add_argument(
-        "obj_dir", type=Path, help="Path to directory containing .obj files"
+        "obj_dir",
+        type=Path,
+        help="Path to scene directory (.obj files for warsaw, semantic annotation dir for hm3d)",
     )
     parser.add_argument("output_file", type=Path, help="Path to output JSON file")
+    parser.add_argument(
+        "--dataset",
+        choices=["warsaw", "hm3d"],
+        default="warsaw",
+        help="Dataset type: 'warsaw' (default) or 'hm3d'",
+    )
     parser.add_argument(
         "--export-dir",
         type=Path,

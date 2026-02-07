@@ -8,6 +8,7 @@ each semantically annotated object is a separate Body with a TriangleMesh.
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from uuid import UUID
 
 import numpy as np
 import trimesh
@@ -19,6 +20,28 @@ from semantic_digital_twin.world_description.connections import FixedConnection
 from semantic_digital_twin.world_description.geometry import Color, TriangleMesh
 from semantic_digital_twin.world_description.shape_collection import ShapeCollection
 from semantic_digital_twin.world_description.world_entity import Body
+
+
+def _look_at(
+    eye: np.ndarray,
+    target: np.ndarray,
+    up: np.ndarray = np.array([0.0, 1.0, 0.0]),
+) -> np.ndarray:
+    """Compute a camera-to-world 4x4 transform (OpenGL: camera looks along -Z)."""
+    forward = target - eye
+    forward = forward / np.linalg.norm(forward)
+
+    right = np.cross(forward, up)
+    right = right / np.linalg.norm(right)
+
+    cam_up = np.cross(right, forward)
+
+    mat = np.eye(4)
+    mat[:3, 0] = right
+    mat[:3, 1] = cam_up
+    mat[:3, 2] = -forward
+    mat[:3, 3] = eye
+    return mat
 
 
 @dataclass
@@ -59,12 +82,15 @@ class HM3DWorldLoader:
     """Mapping from RGB color tuple to SemanticObject."""
 
     _scene_id: str = field(init=False, default="")
+    _original_visuals: Dict[UUID, object] = field(init=False, default_factory=dict)
+    """Saved copy of each body's mesh visual for reset after highlighting."""
 
     def __post_init__(self):
         self.scene_dir = Path(self.scene_dir)
         self._scene_id = self._detect_scene_id()
         self.annotations = self._parse_semantic_txt()
         self.world = self._build_world()
+        self._save_original_state()
 
     def _detect_scene_id(self) -> str:
         """Infer the scene ID from the .semantic.txt file in the directory."""
@@ -234,3 +260,111 @@ class HM3DWorldLoader:
     def room_ids(self) -> List[int]:
         """Return the sorted list of room IDs in this scene."""
         return sorted({ann.room_id for ann in self.annotations.values()})
+
+    @property
+    def object_bodies(self) -> List[Body]:
+        """Return all bodies except the root (i.e. all semantic objects)."""
+        return [b for b in self.world.bodies if b.name.name != "root"]
+
+    # ------------------------------------------------------------------
+    # Rendering & highlighting (mirrors WarsawWorldLoader interface)
+    # ------------------------------------------------------------------
+
+    def _save_original_state(self) -> None:
+        """Snapshot each body's mesh visual so we can restore after highlighting."""
+        for body in self.object_bodies:
+            mesh = body.collision[0].mesh
+            self._original_visuals[body.id] = mesh.visual.copy()
+
+    def _reset_body_colors(self) -> None:
+        """Restore all bodies to their original visual state."""
+        for body in self.object_bodies:
+            body.collision[0].mesh.visual = self._original_visuals[body.id].copy()
+
+    @staticmethod
+    def _apply_highlight_to_group(bodies: List[Body]) -> Dict[UUID, Color]:
+        """Apply distinct highlight colors to a group of bodies.
+
+        Returns a mapping from body id to the Color that was applied.
+        """
+        colors = Color.distinct_html_colors(len(bodies))
+        for body, color in zip(bodies, colors):
+            body_mesh = body.collision[0]
+            body_mesh.override_mesh_with_color(color)
+        return {body.id: color for body, color in zip(bodies, colors)}
+
+    def render_scene_from_camera_pose(
+        self, camera_transform, output_filepath=None
+    ) -> bytes:
+        """Render the world from a single camera pose, return PNG bytes."""
+        scene = trimesh.Scene()
+        for body in self.object_bodies:
+            mesh = body.collision[0].mesh
+            if mesh is not None:
+                scene.add_geometry(mesh, node_name=body.name.name)
+
+        scene.graph[scene.camera.name] = camera_transform
+        png = scene.save_image(resolution=(1024, 768), visible=True)
+
+        if output_filepath:
+            with open(output_filepath, "wb") as f:
+                f.write(png)
+        return png
+
+    def compute_camera_poses(self) -> Dict[str, np.ndarray]:
+        """Compute three camera poses that provide good coverage of the scene.
+
+        Places cameras at 120-degree azimuth intervals around the scene
+        centroid, elevated above center.  Uses Y-up (glTF / HM3D convention).
+        """
+        all_vertices = [
+            body.collision[0].mesh.vertices for body in self.object_bodies
+        ]
+        vertices = np.vstack(all_vertices)
+        centroid = vertices.mean(axis=0)
+
+        extent = vertices.max(axis=0) - vertices.min(axis=0)
+        max_extent = extent.max()
+
+        distance = max_extent * 1.5
+        height_offset = max_extent * 0.5
+
+        up = np.array([0.0, 1.0, 0.0])
+
+        azimuth_angles = {
+            "back": np.radians(180),
+            "front_right": np.radians(-45),
+            "front_left": np.radians(45),
+        }
+
+        poses: Dict[str, np.ndarray] = {}
+        for name, azimuth in azimuth_angles.items():
+            eye = centroid + np.array(
+                [
+                    distance * np.sin(azimuth),
+                    height_offset,
+                    distance * np.cos(azimuth),
+                ]
+            )
+            poses[name] = _look_at(eye, centroid, up)
+
+        return poses
+
+    def export_semantic_annotation_inheritance_structure(
+        self, output_directory: Path
+    ) -> None:
+        """Export the kinematic structure and SemanticAnnotation taxonomy to JSON."""
+        from semantic_digital_twin.semantic_annotation import SemanticAnnotation
+        from krrood.class_diagram.utils.inheritance_structure_exporter import (
+            InheritanceStructureExporter,
+        )
+
+        output_directory.mkdir(parents=True, exist_ok=True)
+
+        self.world.export_kinematic_structure_tree_to_json(
+            output_directory / "kinematic_structure.json",
+            include_connections=False,
+        )
+        InheritanceStructureExporter(
+            SemanticAnnotation, output_directory / "semantic_annotations.json"
+        ).export()
