@@ -31,3 +31,4 @@ model_output/
 
 # Environment / secrets
 .env
+cram-env

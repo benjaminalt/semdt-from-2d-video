@@ -11,7 +11,32 @@ Constructs a semantic digital twin from 2D scene imagery using VLM-based object 
 
 ## Installation
 
-### 1. Install the CRAM dependency
+### 1. Set up PostgreSQL
+
+The pipeline persists worlds and semantic annotations to a PostgreSQL database. Tables are created automatically on first run via SQLAlchemy's `Base.metadata.create_all()`.
+
+**Create the database and user:**
+
+```bash
+# Connect as a superuser (or ask your DB admin)
+psql -U postgres
+
+# Inside psql:
+CREATE USER semdt WITH PASSWORD 'semdt';
+CREATE DATABASE semdt_db OWNER semdt;
+GRANT ALL PRIVILEGES ON DATABASE semdt_db TO semdt;
+\q
+```
+
+**Verify the connection:**
+
+```bash
+psql -h localhost -U semdt -d semdt_db -c "SELECT 1;"
+```
+
+The scripts read connection details from environment variables (see step 4 below). The defaults used throughout the project are `PGDATABASE=semdt_db`, `PGUSER=semdt`, `PGPASSWORD=semdt` on `localhost:5432`.
+
+### 2. Install the CRAM dependency
 
 This project depends on packages from the CRAM monorepo (`semantic_digital_twin`, `krrood`, etc.). Install it first:
 
@@ -26,7 +51,7 @@ pip install poetry
 poetry install
 ```
 
-### 2. Install this package
+### 3. Install this package
 
 With the same virtual environment activated:
 
@@ -35,7 +60,7 @@ cd semdt-from-2d-video
 pip install -e .
 ```
 
-### 3. Configure environment variables
+### 4. Configure environment variables
 
 The scripts require database credentials and an API key:
 
@@ -43,6 +68,7 @@ The scripts require database credentials and an API key:
 export PGDATABASE=<your_database>
 export PGUSER=<your_user>
 export PGPASSWORD=<your_password>
+export PGPORT=<postgres_port>
 export OPENROUTER_API_KEY=<your_key>  # for VLM queries
 ```
 
@@ -55,6 +81,8 @@ This project uses the [Habitat-Matterport 3D (HM3D)](https://aihabitat.org/datas
 | `hm3d-minival-glb-v0.2/` | `<scene>.glb` | Visual mesh (textured) |
 | `hm3d-minival-habitat-v0.2/` | `<scene>.basis.glb` + `<scene>.basis.navmesh` | Habitat simulator mesh + navigation mesh |
 | `hm3d-minival-semantic-annots-v0.2/` | `<scene>.semantic.glb` + `<scene>.semantic.txt` | Semantic mesh + label lookup table |
+
+You can download the dataset [here](https://nc.uni-bremen.de/index.php/s/mQpn5wWDsmSzZEJ).
 
 ### How semantic annotations work
 

@@ -12,7 +12,9 @@ dependencies = [
     "trimesh",
     "requests",
     "sqlalchemy",
-    "pyglet"
+    "pyglet",
+    "pyrender",
+    "PyOpenGL-accelerate"
 ]
 
 [project.optional-dependencies]

@@ -31,7 +31,7 @@ DB_USER = os.getenv("PGUSER")
 DB_PASSWORD = os.getenv("PGPASSWORD")
 
 DB_HOST = "localhost"
-DB_PORT = 5432
+DB_PORT = os.getenv("PGPORT", 5432)
 
 connection_string = (
     f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
@@ -49,7 +49,7 @@ def create_camera_poses() -> Dict[str, np.ndarray]:
     Create camera transforms
     """
     return {
-        "back": np.array(
+        "top": np.array(
             [
                 [0.019661, 0.565278, -0.824666, -3.302801],
                 [-0.999801, 0.008306, -0.018143, -0.113984],
@@ -91,7 +91,7 @@ def query_vlm(
 
 ## Your Task
 Analyze images and classify objects according to a given ontology. You will receive:
-1. Three images of a scene with original textures from different viewpoints (diagonal front left, diagonal front right, back)
+1. Three images of a scene with original textures from different viewpoints (diagonal front left, diagonal front right, top)
 2. Three corresponding images with specific objects highlighted in distinct colors from the same viewpoints
 3. The prior from a previous semantic segmentation step for each highlighted object
 
@@ -131,12 +131,12 @@ Respond with valid JSON:
 ## Images
 
 Images 1-3: Original scene with natural textures from three viewpoints:
-  - Image 1: Back view
+  - Image 1: Top view
   - Image 2: Diagonal front right view
   - Image 3: Diagonal front left view
 
 Images 4-6: Same scene with target objects highlighted in distinct colors from the same viewpoints:
-  - Image 4: Back view (highlighted)
+  - Image 4: Top view (highlighted)
   - Image 5: Diagonal front right view (highlighted)
   - Image 6: Diagonal front left view (highlighted)
 
@@ -263,15 +263,53 @@ def main(args):
     print(f"Loading world from {obj_dir}...")
 
     if args.dataset == "hm3d":
-        world_loader = HM3DWorldLoader(scene_dir=obj_dir)
-        world = world_loader.world
-        bodies = world_loader.object_bodies
-        camera_poses_dict = world_loader.compute_camera_poses()
+        # Derive the visual GLB path from the semantic annotations path.
+        # e.g. .../hm3d-minival-semantic-annots-v0.2/00800-TEEsavR23oF
+        #   -> .../hm3d-minival-glb-v0.2/00800-TEEsavR23oF/<hash>.glb
+        visual_glb_path = None
+        glb_dir = obj_dir.parent.parent / "hm3d-minival-glb-v0.2" / obj_dir.name
+        if glb_dir.exists():
+            glb_files = list(glb_dir.glob("*.glb"))
+            if glb_files:
+                visual_glb_path = glb_files[0]
+                print(f"Using visual GLB: {visual_glb_path}")
+
+        if args.num_rooms is not None:
+            # Discover available rooms from the semantic TXT (no GLB parsing
+            # needed), then create a dedicated loader per room so each world
+            # contains only that room's meshes.
+            all_room_ids = HM3DWorldLoader.discover_room_ids(obj_dir)
+            room_ids = all_room_ids[:args.num_rooms]
+            print(f"Will process {len(room_ids)} room(s): {room_ids} "
+                  f"(out of {len(all_room_ids)} total)")
+
+            room_batches = []
+            for rid in room_ids:
+                print(f"  Loading room {rid}...")
+                loader = HM3DWorldLoader(
+                    scene_dir=obj_dir, visual_glb_path=visual_glb_path,
+                    room_id=rid,
+                )
+                bodies = loader.object_bodies
+                poses = loader.compute_camera_poses()
+                room_batches.append((f"room{rid}", bodies, poses, loader))
+                print(f"  Room {rid}: {len(bodies)} objects")
+
+            # Use the first room's loader/world for export & DB persistence
+            world_loader = room_batches[0][3]
+            world = world_loader.world
+        else:
+            world_loader = HM3DWorldLoader(scene_dir=obj_dir, visual_glb_path=visual_glb_path)
+            world = world_loader.world
+            bodies = world_loader.object_bodies
+            camera_poses_dict = world_loader.compute_camera_poses(bodies=bodies)
+            room_batches = [(None, bodies, camera_poses_dict, world_loader)]
     else:
         world_loader = WarsawWorldLoader(obj_dir)
         world = world_loader.world
         bodies = world.bodies_with_enabled_collision
         camera_poses_dict = create_camera_poses()
+        room_batches = [(None, bodies, camera_poses_dict, world_loader)]
 
     # Export semantic annotations JSON for VLM context
     world_loader.export_semantic_annotation_inheritance_structure(export_path)
@@ -280,71 +318,94 @@ def main(args):
     object_taxonomy = (export_path / "semantic_annotations.json").read_text()
 
     if not args.skip_vlm and not args.render_only:
-        # Render original scene from 3 viewpoints
-        print("Rendering original scene from 3 viewpoints...")
-        original_images = []
-        for pose_name, camera_pose in camera_poses_dict.items():
-            print(f"  Rendering {pose_name} view...")
-            image_bytes = world_loader.render_scene_from_camera_pose(
-                camera_pose, model_input_dir / f"scene_orig_{pose_name}.png"
-            )
-            original_images.append(image_bytes)
-
-        # Process groups
         all_responses = []
-        num_groups = (len(bodies) + group_size - 1) // group_size
+        summary = []
 
-        for i, start in enumerate(range(0, len(bodies), group_size)):
-            group = bodies[start : start + group_size]
-            print(f"Processing group {i + 1}/{num_groups} ({len(group)} objects)...")
+        for room_tag, bodies, camera_poses_dict, batch_loader in room_batches:
+            room_prefix = f"{room_tag}_" if room_tag else ""
+            room_output_dir = model_input_dir / room_tag if room_tag else model_input_dir
+            room_output_dir.mkdir(parents=True, exist_ok=True)
 
-            # Reset visuals and apply highlight colors
-            world_loader._reset_body_colors()
-            bodies_colors = world_loader._apply_highlight_to_group(group)
-            color_names = list(
-                map(lambda c: c.closest_css3_color_name(), bodies_colors.values())
-            )
+            if room_tag:
+                print(f"\n{'='*60}")
+                print(f"Processing {room_tag} ({len(bodies)} objects)")
+                print(f"{'='*60}")
 
-            # Render highlighted scene from 3 viewpoints
-            print(f"  Rendering highlighted scene from 3 viewpoints...")
-            highlighted_images = []
+            # Render original scene from 3 viewpoints
+            print("Rendering original scene from 3 viewpoints...")
+            original_images = []
             for pose_name, camera_pose in camera_poses_dict.items():
-                image_bytes = world_loader.render_scene_from_camera_pose(
-                    camera_pose, model_input_dir / f"scene_{i}_{pose_name}.png"
+                print(f"  Rendering {pose_name} view...")
+                image_bytes = batch_loader.render_scene_from_camera_pose(
+                    camera_pose,
+                    room_output_dir / f"scene_orig_{pose_name}.png",
+                    headless=args.headless, use_visual_mesh=True,
                 )
-                highlighted_images.append(image_bytes)
+                original_images.append(image_bytes)
 
-            semantic_labels_dict = {
-                body_id: color_names[i]
-                for i, body_id in enumerate(bodies_colors.keys())
-            }
-            semantic_labels = ""
-            for body_uuid, color_name in semantic_labels_dict.items():
-                body = next(filter(lambda b: b.id == body_uuid, bodies))
-                semantic_labels += f"{color_name}: {body.name}\n"
+            # Process groups
+            room_responses = []
+            num_groups = (len(bodies) + group_size - 1) // group_size
 
-            # Query VLM
-            print(f"  Querying VLM for group {i + 1}...")
-            response = query_vlm(
-                original_images,
-                highlighted_images,
-                object_taxonomy,
-                color_names,
-                semantic_labels,
-            )
-            print(f"  Response: {response}")
+            for i, start in enumerate(range(0, len(bodies), group_size)):
+                group = bodies[start : start + group_size]
+                print(f"Processing group {i + 1}/{num_groups} ({len(group)} objects)...")
 
-            all_responses.append(
-                {
-                    "group_index": i,
-                    "body_ids": list(map(str, bodies_colors.keys())),
-                    "colors": color_names,
-                    "vlm_response": response,
+                # Gray out non-highlighted objects (HM3D) or restore textures (Warsaw)
+                if hasattr(batch_loader, '_neutralize_body_colors'):
+                    batch_loader._neutralize_body_colors()
+                else:
+                    batch_loader._reset_body_colors()
+                bodies_colors = batch_loader._apply_highlight_to_group(group)
+                color_names = list(
+                    map(lambda c: c.closest_css3_color_name(), bodies_colors.values())
+                )
+
+                # Render highlighted scene from 3 viewpoints
+                print(f"  Rendering highlighted scene from 3 viewpoints...")
+                highlighted_images = []
+                for pose_name, camera_pose in camera_poses_dict.items():
+                    image_bytes = batch_loader.render_scene_from_camera_pose(
+                        camera_pose,
+                        room_output_dir / f"scene_{i}_{pose_name}.png",
+                        headless=args.headless,
+                    )
+                    highlighted_images.append(image_bytes)
+
+                semantic_labels_dict = {
+                    body_id: color_names[i]
+                    for i, body_id in enumerate(bodies_colors.keys())
                 }
-            )
+                semantic_labels = ""
+                for body_uuid, color_name in semantic_labels_dict.items():
+                    body = next(filter(lambda b: b.id == body_uuid, bodies))
+                    semantic_labels += f"{color_name}: {body.name}\n"
 
-            # Reset for next iteration
-            world_loader._reset_body_colors()
+                # Query VLM
+                print(f"  Querying VLM for group {i + 1}...")
+                response = query_vlm(
+                    original_images,
+                    highlighted_images,
+                    object_taxonomy,
+                    color_names,
+                    semantic_labels,
+                )
+                print(f"  Response: {response}")
+
+                room_responses.append(
+                    {
+                        "group_index": i,
+                        "room": room_tag,
+                        "body_ids": list(map(str, bodies_colors.keys())),
+                        "colors": color_names,
+                        "vlm_response": response,
+                    }
+                )
+
+                # Reset for next iteration
+                batch_loader._reset_body_colors()
+
+            all_responses.extend(room_responses)
 
         # Save raw responses
         with open(output_file, "w") as f:
@@ -362,37 +423,53 @@ def main(args):
         # Render-only mode: just save images without calling VLM
         print("Render-only mode: Saving images without VLM queries...")
 
-        # Render original scene from 3 viewpoints
-        print("Rendering original scene from 3 viewpoints...")
-        for pose_name, camera_pose in camera_poses_dict.items():
-            print(f"  Rendering {pose_name} view...")
-            world_loader.render_scene_from_camera_pose(
-                camera_pose, model_input_dir / f"scene_orig_{pose_name}.png"
-            )
+        for room_tag, bodies, camera_poses_dict, batch_loader in room_batches:
+            room_output_dir = model_input_dir / room_tag if room_tag else model_input_dir
+            room_output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Process groups
-        num_groups = (len(bodies) + group_size - 1) // group_size
+            if room_tag:
+                print(f"\n{'='*60}")
+                print(f"Rendering {room_tag} ({len(bodies)} objects)")
+                print(f"{'='*60}")
 
-        for i, start in enumerate(range(0, len(bodies), group_size)):
-            group = bodies[start : start + group_size]
-            print(f"Processing group {i + 1}/{num_groups} ({len(group)} objects)...")
-
-            # Reset visuals and apply highlight colors
-            world_loader._reset_body_colors()
-            bodies_colors = world_loader._apply_highlight_to_group(group)
-            color_names = list(
-                map(lambda c: c.closest_css3_color_name(), bodies_colors.values())
-            )
-
-            # Render highlighted scene from 3 viewpoints
-            print(f"  Rendering highlighted scene from 3 viewpoints...")
+            # Render original scene from 3 viewpoints
+            print("Rendering original scene from 3 viewpoints...")
             for pose_name, camera_pose in camera_poses_dict.items():
-                world_loader.render_scene_from_camera_pose(
-                    camera_pose, model_input_dir / f"scene_{i}_{pose_name}.png"
+                print(f"  Rendering {pose_name} view...")
+                batch_loader.render_scene_from_camera_pose(
+                    camera_pose,
+                    room_output_dir / f"scene_orig_{pose_name}.png",
+                    headless=args.headless, use_visual_mesh=True,
                 )
 
-            # Reset for next iteration
-            world_loader._reset_body_colors()
+            # Process groups
+            num_groups = (len(bodies) + group_size - 1) // group_size
+
+            for i, start in enumerate(range(0, len(bodies), group_size)):
+                group = bodies[start : start + group_size]
+                print(f"Processing group {i + 1}/{num_groups} ({len(group)} objects)...")
+
+                # Gray out non-highlighted objects (HM3D) or restore textures (Warsaw)
+                if hasattr(batch_loader, '_neutralize_body_colors'):
+                    batch_loader._neutralize_body_colors()
+                else:
+                    batch_loader._reset_body_colors()
+                bodies_colors = batch_loader._apply_highlight_to_group(group)
+                color_names = list(
+                    map(lambda c: c.closest_css3_color_name(), bodies_colors.values())
+                )
+
+                # Render highlighted scene from 3 viewpoints
+                print(f"  Rendering highlighted scene from 3 viewpoints...")
+                for pose_name, camera_pose in camera_poses_dict.items():
+                    batch_loader.render_scene_from_camera_pose(
+                        camera_pose,
+                        room_output_dir / f"scene_{i}_{pose_name}.png",
+                        headless=args.headless,
+                    )
+
+                # Reset for next iteration
+                batch_loader._reset_body_colors()
 
         print(f"All images saved to {model_input_dir}")
         all_responses = []
@@ -453,6 +530,19 @@ if __name__ == "__main__":
         action="store_true",
         default=False,
         help="Only render images without calling VLM. Images are saved to scripts/model_input/",
+    )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        default=False,
+        help="Use offscreen rendering (no display required)",
+    )
+    parser.add_argument(
+        "--num-rooms",
+        type=int,
+        default=None,
+        help="HM3D only: process up to N rooms (each room separately). "
+             "If omitted, processes all objects as one batch.",
     )
     args = parser.parse_args()
     main(args)
