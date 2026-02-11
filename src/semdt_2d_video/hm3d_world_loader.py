@@ -67,7 +67,7 @@ class HM3DWorldLoader:
     Optionally accepts a path to the visual GLB for textured rendering.
     """
 
-    scene_dir: Path
+    scene_dir: Optional[Path] = None
     """Directory containing the semantic GLB and TXT files for one scene."""
 
     visual_glb_path: Optional[Path] = None
@@ -76,8 +76,8 @@ class HM3DWorldLoader:
     room_id: Optional[int] = None
     """If set, only load objects belonging to this room."""
 
-    world: World = field(init=False, default=None)
-    """The constructed World."""
+    world: World = field(default=None)
+    """The constructed World (built from files, or provided directly via from_world)."""
 
     annotations: Dict[Tuple[int, int, int], SemanticObject] = field(
         init=False, default_factory=dict
@@ -92,12 +92,40 @@ class HM3DWorldLoader:
     """Pre-loaded textured visual scene from the visual GLB (if available)."""
 
     def __post_init__(self):
+        if self.world is not None:
+            # World provided directly (e.g. loaded from DB) — skip file loading
+            self._scene_id = self.world.name or ""
+            self.annotations = {}
+            self._original_visuals = {}
+            self._visual_scene = None
+            self._save_original_state()
+            return
         self.scene_dir = Path(self.scene_dir)
         self._scene_id = self._detect_scene_id()
         self.annotations = self._parse_semantic_txt()
         self.world = self._build_world()
         self._save_original_state()
         self._load_visual_scene()
+
+    @classmethod
+    def from_world(cls, world: World) -> "HM3DWorldLoader":
+        """Create an HM3DWorldLoader wrapping an existing World (e.g. loaded from DB).
+
+        Bypasses all file-based loading (GLB parsing, semantic TXT parsing).
+        The resulting loader supports rendering, highlighting, and camera pose
+        computation but will have an empty ``annotations`` dict.
+        """
+        loader = object.__new__(cls)
+        loader.scene_dir = None
+        loader.visual_glb_path = None
+        loader.room_id = None
+        loader.world = world
+        loader.annotations = {}
+        loader._scene_id = world.name or ""
+        loader._original_visuals = {}
+        loader._visual_scene = None
+        loader._save_original_state()
+        return loader
 
     def _detect_scene_id(self) -> str:
         """Infer the scene ID from the .semantic.txt file in the directory."""

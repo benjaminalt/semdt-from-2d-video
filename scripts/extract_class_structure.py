@@ -23,8 +23,7 @@ from krrood.ormatic.dao import to_dao
 sys.path.insert(
     0, str(Path(__file__).parent.parent / "semantic_digital_twin" / "scripts")
 )
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-from hm3d_world_loader import HM3DWorldLoader
+from semdt_2d_video.hm3d_world_loader import HM3DWorldLoader
 
 DB_NAME = os.getenv("PGDATABASE")
 DB_USER = os.getenv("PGUSER")

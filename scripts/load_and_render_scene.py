@@ -24,6 +24,7 @@ from krrood.ormatic.utils import create_engine
 # Import ORM interface - this brings in all DAOs including WorldMappingDAO
 from semantic_digital_twin.orm.ormatic_interface import WorldMappingDAO, Base
 from semantic_digital_twin.adapters.warsaw_world_loader import WarsawWorldLoader
+from src.hm3d_world_loader import HM3DWorldLoader
 from semantic_digital_twin.spatial_computations.raytracer import RayTracer
 from semantic_digital_twin.spatial_types import TransformationMatrix
 from semantic_digital_twin.world import World
@@ -263,23 +264,36 @@ def render_world(
     Returns:
         PNG image data as bytes
     """
-    # Use WarsawWorldLoader for textured rendering with proper camera setup
-    world_loader = WarsawWorldLoader.from_world(world)
+    is_hm3d = world.name and world.name.startswith("hm3d_")
 
-    # Create RayTracer scene with textures
-    rt = RayTracer(world)
-    rt.update_scene()
-    scene = rt.scene
+    if is_hm3d:
+        world_loader = HM3DWorldLoader.from_world(world)
+        camera_poses = world_loader.compute_camera_poses()
+        pose_names = list(camera_poses.keys())
+        idx = camera_index if camera_index < len(pose_names) else 0
+        camera_pose = camera_poses[pose_names[idx]]
 
-    # Set up camera from predefined poses
-    camera_poses = world_loader._predefined_camera_transforms
-    if 0 <= camera_index < len(camera_poses):
-        camera_pose = camera_poses[camera_index]
+        scene = trimesh.Scene()
+        for body in world_loader.object_bodies:
+            mesh = body.collision[0].mesh
+            if mesh is not None:
+                scene.add_geometry(mesh, node_name=body.name.name)
+        scene.graph[scene.camera.name] = camera_pose
     else:
-        camera_pose = camera_poses[0]
+        world_loader = WarsawWorldLoader.from_world(world)
 
-    scene.camera.fov = world_loader._camera_field_of_view
-    scene.graph[scene.camera.name] = camera_pose
+        rt = RayTracer(world)
+        rt.update_scene()
+        scene = rt.scene
+
+        camera_poses = world_loader._predefined_camera_transforms
+        if 0 <= camera_index < len(camera_poses):
+            camera_pose = camera_poses[camera_index]
+        else:
+            camera_pose = camera_poses[0]
+
+        scene.camera.fov = world_loader._camera_field_of_view
+        scene.graph[scene.camera.name] = camera_pose
 
     # Add semantic label markers to the scene
     if show_labels:

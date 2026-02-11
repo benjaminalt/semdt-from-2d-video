@@ -14,16 +14,12 @@ Usage:
 """
 
 import argparse
-import sys
 from pathlib import Path
 
 import numpy as np
 import trimesh
 
-# Add src/ to import path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-
-from hm3d_world_loader import HM3DWorldLoader
+from semdt_2d_video.hm3d_world_loader import HM3DWorldLoader
 
 DATASETS = Path(__file__).resolve().parent.parent / "datasets" / "matterport3d"
 

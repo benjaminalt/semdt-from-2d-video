@@ -42,6 +42,8 @@ from semantic_digital_twin.world_description.world_entity import (
 )
 from semantic_digital_twin.utils import InheritanceStructureExporter
 
+from semdt_2d_video.hm3d_world_loader import HM3DWorldLoader
+
 
 # Load generated_classes module BEFORE importing ormatic_interface
 # (ormatic_interface may have imports that depend on generated_classes)
@@ -76,7 +78,7 @@ DB_USER = os.getenv("PGUSER")
 DB_PASSWORD = os.getenv("PGPASSWORD")
 
 DB_HOST = "localhost"
-DB_PORT = 5432
+DB_PORT = os.getenv("PGPORT", 5432)
 
 connection_string = (
     f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
@@ -674,7 +676,7 @@ def main(args):
                 f"No world found with database_id {args.world_database_id}"
             )
 
-    world_loader = WarsawWorldLoader.from_world(world)
+    world_loader = WarsawWorldLoader.from_world(world) if args.dataset == "warsaw" else HM3DWorldLoader.from_world(world)
 
     # Load summary
     with open(args.summary_json, "r") as f:
@@ -948,6 +950,12 @@ if __name__ == "__main__":
         "world_database_id",
         type=int,
         help="DB ID of the world stored in the previous step",
+    )
+    parser.add_argument(
+        "--dataset",
+        choices=["warsaw", "hm3d"],
+        default="warsaw",
+        help="Dataset type: 'warsaw' (default) or 'hm3d'",
     )
     parser.add_argument(
         "--output-dir",
