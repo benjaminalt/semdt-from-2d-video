@@ -26,7 +26,7 @@ from krrood.ormatic.utils import create_engine
 from semantic_digital_twin.orm.ormatic_interface import WorldMappingDAO, Base
 from semantic_digital_twin.adapters.warsaw_world_loader import WarsawWorldLoader
 from semantic_digital_twin.spatial_computations.raytracer import RayTracer
-from semantic_digital_twin.spatial_types import TransformationMatrix
+from semantic_digital_twin.spatial_types import HomogeneousTransformationMatrix
 from semantic_digital_twin.world import World
 from semantic_digital_twin.world_description.geometry import TriangleMesh, FileMesh
 from semantic_digital_twin.world_description.shape_collection import ShapeCollection
@@ -171,7 +171,7 @@ def create_exploded_world(world: World, explosion_factor: float = 1.0) -> World:
                     )
 
                     # Create new transform by copying and updating translation; preserve rotation
-                    new_transform = TransformationMatrix(
+                    new_transform = HomogeneousTransformationMatrix(
                         data=original_connection_transform,
                         reference_frame=original_connection_transform.reference_frame,
                         child_frame=original_connection_transform.child_frame,

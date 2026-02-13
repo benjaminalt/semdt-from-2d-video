@@ -12,7 +12,7 @@ import trimesh
 import sys
 
 from semantic_digital_twin.adapters.warsaw_world_loader import WarsawWorldLoader
-from semantic_digital_twin.spatial_types import TransformationMatrix
+from semantic_digital_twin.spatial_types import HomogeneousTransformationMatrix
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session

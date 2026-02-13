@@ -24,7 +24,6 @@ from krrood.ormatic.utils import create_engine
 from semantic_digital_twin.adapters.warsaw_world_loader import WarsawWorldLoader
 from semantic_digital_twin.orm.ormatic_interface import WorldMappingDAO
 from semantic_digital_twin.spatial_computations.raytracer import RayTracer
-from semantic_digital_twin.spatial_types import TransformationMatrix
 from semantic_digital_twin.world import World
 
 # Database connection settings from environment

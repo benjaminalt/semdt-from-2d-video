@@ -14,7 +14,7 @@ import numpy as np
 import trimesh
 
 from semantic_digital_twin.datastructures.prefixed_name import PrefixedName
-from semantic_digital_twin.spatial_types import TransformationMatrix
+from semantic_digital_twin.spatial_types import HomogeneousTransformationMatrix
 from semantic_digital_twin.world import World
 from semantic_digital_twin.world_description.connections import FixedConnection
 from semantic_digital_twin.world_description.geometry import Color, TriangleMesh
@@ -322,7 +322,7 @@ class HM3DWorldLoader:
 
                 triangle_mesh = TriangleMesh(
                     mesh=combined,
-                    origin=TransformationMatrix(),
+                    origin=HomogeneousTransformationMatrix(),
                     color=Color(R=r / 255.0, G=g / 255.0, B=b / 255.0),
                 )
                 shape_collection = ShapeCollection([triangle_mesh])

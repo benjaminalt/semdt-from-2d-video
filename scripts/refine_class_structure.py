@@ -30,7 +30,7 @@ import requests
 
 from semantic_digital_twin.adapters.warsaw_world_loader import WarsawWorldLoader
 from semantic_digital_twin.semantic_annotations import semantic_annotations as sa_module
-from semantic_digital_twin.semantic_annotations.mixins import HasBody
+from semantic_digital_twin.semantic_annotations.mixins import HasRootBody
 from semantic_digital_twin.world import World
 from semantic_digital_twin.semantic_annotations.in_memory_builder import (
     SemanticAnnotationClassBuilder,
@@ -98,7 +98,7 @@ class PendingAnnotation:
 
     id: str  # Unique identifier for this pending annotation
     class_name: str  # The class to instantiate
-    body_id: Optional[str] = None  # The body this annotation relates to (if HasBody)
+    body_id: Optional[str] = None  # The body this annotation relates to (if HasRootBody)
     field_assignments: Dict[str, Any] = field(default_factory=dict)
     # Maps field_name -> either:
     #   - str (pending_annotation_id) for SemanticAnnotation fields
@@ -291,7 +291,7 @@ Respond with valid JSON:
                 },
                 data=json.dumps(
                     {
-                        "model": "mistralai/devstral-2512:free",
+                        "model": "meta-llama/llama-3.3-70b-instruct",
                         "messages": [
                             {
                                 "role": "system",
@@ -538,7 +538,7 @@ Respond with valid JSON:
                 kwargs = {}
 
                 # Handle body field
-                if issubclass(cls, HasBody) and annotation.body_id:
+                if issubclass(cls, HasRootBody) and annotation.body_id:
                     body = next(
                         (
                             b
