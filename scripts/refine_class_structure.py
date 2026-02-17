@@ -62,6 +62,16 @@ def _preload_generated_classes():
 
     setattr(parent_module, "generated_classes", generated_module)
 
+    # Also expose generated classes via in_memory_builder so that ORM files
+    # generated with in-memory classes (whose __module__ was in_memory_builder)
+    # can still resolve their references.
+    import semantic_digital_twin.semantic_annotations.in_memory_builder as imb
+
+    for name in dir(generated_module):
+        obj = getattr(generated_module, name)
+        if isinstance(obj, type) and issubclass(obj, SemanticAnnotation) and obj is not SemanticAnnotation:
+            setattr(imb, name, obj)
+
 
 _preload_generated_classes()
 
@@ -548,7 +558,7 @@ Respond with valid JSON:
                         None,
                     )
                     if body:
-                        kwargs["body"] = body
+                        kwargs["root"] = body
                     else:
                         raise ValueError(f"Body {annotation.body_id} not found")
 
@@ -731,7 +741,9 @@ def main(args):
             builder = SemanticAnnotationClassBuilder(
                 cls_name, template_name="dataclass_template.py.jinja"
             )
-            cls = builder.add_base(superclass).build()
+            cls = builder.add_base(superclass).build(
+                module="semantic_digital_twin.semantic_annotations.generated_classes"
+            )
             new_class_builders.append(builder)
             class_lookup[cls_name] = cls
             logging.info(f"Created class '{cls_name}'")
@@ -749,13 +761,14 @@ def main(args):
             f"Created pending annotation: {cls_name} for body {obj['body_id']}"
         )
 
-    # Write all new classes to a separate generated file
+    # Write new classes to the generated file, appending to any existing content
     if new_class_builders:
-        generated_file = SemanticAnnotationFilePaths.GENERATED_CLASSES_FILE.value
-        SemanticAnnotationClassBuilder.write_classes_to_file(
-            new_class_builders, Path(generated_file)
+        generated_file = Path(SemanticAnnotationFilePaths.GENERATED_CLASSES_FILE.value)
+        for builder in new_class_builders:
+            builder.append_to_file(generated_file)
+        logging.info(
+            f"Appended {len(new_class_builders)} new classes to {generated_file}"
         )
-        logging.info(f"Wrote {len(new_class_builders)} new classes to {generated_file}")
 
     logging.info(
         f"Phase 1 complete: {len(resolver.pending_annotations)} pending annotations"
@@ -876,7 +889,8 @@ def main(args):
 
             # Write the regenerated ORM to file
             orm_path = (
-                Path(__file__).parent.parent
+                Path(__file__).parent.parent.parent
+                / "cognitive_robot_abstract_machine"
                 / "semantic_digital_twin"
                 / "src"
                 / "semantic_digital_twin"
@@ -892,6 +906,20 @@ def main(args):
 
             get_dao_class.cache_clear()
             get_alternative_mapping.cache_clear()
+
+            # Ensure all classes referenced by the regenerated ORM are present
+            # on the generated_classes module before reloading
+            _gc_mod_name = "semantic_digital_twin.semantic_annotations.generated_classes"
+            _gc_mod = sys.modules.get(_gc_mod_name)
+            if _gc_mod is not None:
+                for _cls_name, _cls in class_lookup.items():
+                    if not hasattr(_gc_mod, _cls_name):
+                        setattr(_gc_mod, _cls_name, _cls)
+            # Also patch in_memory_builder for backward compat with older ORM files
+            import semantic_digital_twin.semantic_annotations.in_memory_builder as _imb
+            for _cls_name, _cls in class_lookup.items():
+                if not hasattr(_imb, _cls_name):
+                    setattr(_imb, _cls_name, _cls)
 
             # Reload the ormatic_interface module to pick up new DAO classes
             import importlib
