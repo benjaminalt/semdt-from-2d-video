@@ -24,7 +24,7 @@ from krrood.ormatic.utils import create_engine
 # Import ORM interface - this brings in all DAOs including WorldMappingDAO
 from semantic_digital_twin.orm.ormatic_interface import WorldMappingDAO, Base
 from semantic_digital_twin.adapters.warsaw_world_loader import WarsawWorldLoader
-from src.hm3d_world_loader import HM3DWorldLoader
+from semdt_2d_video.hm3d_world_loader import HM3DWorldLoader
 from semantic_digital_twin.spatial_computations.raytracer import RayTracer
 from semantic_digital_twin.world import World
 from semantic_digital_twin.world_description.world_entity import Body
@@ -85,14 +85,17 @@ def print_semantic_annotations(world: World) -> None:
         print(f"\n{i}. {annotation.__class__.__name__}")
         print(f"   Name: {annotation.name}")
 
-        # Get associated bodies
-        bodies = list(annotation.bodies)
+        try:
+            bodies = list(annotation.bodies)
+        except Exception:
+            bodies = []
+
         if bodies:
             print(f"   Bodies ({len(bodies)}):")
             for body in bodies:
                 print(f"      - {body.name}")
         else:
-            print("   Bodies: None")
+            print("   Bodies: None or not properly linked")
 
     print("\n" + "=" * 60)
     print(f"Total: {len(world.semantic_annotations)} semantic annotations")
@@ -118,14 +121,29 @@ def print_bodies_with_annotations(world: World) -> None:
 def get_body_semantic_labels(world: World) -> Dict[Body, List[str]]:
     """
     Build a mapping from bodies to their semantic annotation class names.
+    Safely skips annotations that are not properly linked to a body (root is None).
     """
     body_labels: Dict[Body, List[str]] = {}
+
     for annotation in world.semantic_annotations:
-        for body in annotation.bodies:
+
+        # Skip annotations that are not linked to any root/body
+        if getattr(annotation, "root", None) is None:
+            continue
+
+        try:
+            bodies = list(annotation.bodies)
+        except Exception:
+            # In case something unexpected still happens
+            continue
+
+        for body in bodies:
             if body not in body_labels:
                 body_labels[body] = []
             body_labels[body].append(annotation.__class__.__name__)
+
     return body_labels
+
 
 
 def compute_body_centroid(world: World, body: Body) -> np.ndarray:
