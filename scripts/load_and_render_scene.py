@@ -24,10 +24,11 @@ from krrood.ormatic.utils import create_engine
 # Import ORM interface - this brings in all DAOs including WorldMappingDAO
 from semantic_digital_twin.orm.ormatic_interface import WorldMappingDAO, Base
 from semantic_digital_twin.adapters.warsaw_world_loader import WarsawWorldLoader
-from src.hm3d_world_loader import HM3DWorldLoader
 from semantic_digital_twin.spatial_computations.raytracer import RayTracer
 from semantic_digital_twin.world import World
 from semantic_digital_twin.world_description.world_entity import Body
+
+from semdt_2d_video.hm3d_world_loader import HM3DWorldLoader
 
 # Database connection settings from environment
 DB_NAME = os.getenv("PGDATABASE")
@@ -65,6 +66,15 @@ def load_world_by_name(session: Session, name: str) -> Optional[World]:
 def load_world_by_id(session: Session, db_id: int) -> Optional[World]:
     """Load a world from the database by its database ID."""
     query = select(WorldMappingDAO).where(WorldMappingDAO.database_id == db_id)
+    result = session.scalars(query).first()
+    if result is None:
+        return None
+    return result.from_dao()
+
+
+def load_latest_world(session: Session) -> Optional[World]:
+    """Load the most recently inserted world from the database."""
+    query = select(WorldMappingDAO).order_by(WorldMappingDAO.database_id.desc()).limit(1)
     result = session.scalars(query).first()
     if result is None:
         return None
@@ -331,7 +341,7 @@ def main(args):
 
     try:
         # If no world specified, list available worlds
-        if args.world_name is None and args.id is None:
+        if args.world_name is None and args.id is None and not args.latest:
             print("Available worlds in database:")
             print("-" * 40)
             worlds = list_available_worlds(session)
@@ -346,7 +356,13 @@ def main(args):
             return
 
         # Load the specified world
-        if args.id is not None:
+        if args.latest:
+            print("Loading latest world...")
+            world = load_latest_world(session)
+            if world is None:
+                print("Error: No worlds found in database.", file=sys.stderr)
+                sys.exit(1)
+        elif args.id is not None:
             print(f"Loading world with ID: {args.id}...")
             world = load_world_by_id(session, args.id)
             if world is None:
@@ -400,6 +416,11 @@ if __name__ == "__main__":
         "--id",
         type=int,
         help="Load world by database ID instead of name.",
+    )
+    parser.add_argument(
+        "--latest",
+        action="store_true",
+        help="Load the most recently inserted world.",
     )
     parser.add_argument(
         "--save",

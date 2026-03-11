@@ -536,12 +536,13 @@ class HM3DWorldLoader:
     def compute_camera_poses(
         self, bodies: Optional[List[Body]] = None,
     ) -> Dict[str, np.ndarray]:
-        """Compute three camera poses that provide good coverage of the scene.
+        """Compute four camera poses from the top corners of the scene's bounding box.
 
         Auto-detects the up axis from the bounding box (the axis with the
         smallest extent corresponds to floor-to-ceiling height in indoor
-        scenes).  Places cameras at two azimuth angles around the centroid
-        plus a top-down view.  If *bodies* is None, uses all object bodies.
+        scenes).  Places cameras at all four top corners of the bounding
+        cube, each looking at the centroid.  If *bodies* is None, uses all
+        object bodies.
         """
         if bodies is None:
             bodies = self.object_bodies
@@ -565,8 +566,10 @@ class HM3DWorldLoader:
         up[up_idx] = 1.0
 
         azimuth_angles = {
-            "front_right": np.radians(-45),
             "front_left": np.radians(45),
+            "front_right": np.radians(-45),
+            "back_left": np.radians(135),
+            "back_right": np.radians(-135),
         }
 
         poses: Dict[str, np.ndarray] = {}
@@ -577,14 +580,6 @@ class HM3DWorldLoader:
             offset[up_idx] = height_offset
             eye = centroid + offset
             poses[name] = _look_at(eye, centroid, up)
-
-        # Top-down view: camera above, looking down along the up axis
-        top_offset = np.zeros(3)
-        top_offset[up_idx] = distance
-        top_eye = centroid + top_offset
-        top_up = np.zeros(3)
-        top_up[ground[1]] = -1.0
-        poses["top"] = _look_at(top_eye, centroid, up=top_up)
 
         return poses
 

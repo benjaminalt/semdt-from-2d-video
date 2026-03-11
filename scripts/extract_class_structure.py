@@ -90,8 +90,8 @@ def query_vlm(
 
 ## Your Task
 Analyze images and classify objects according to a given ontology. You will receive:
-1. Three images of a scene with original textures from different viewpoints (diagonal front left, diagonal front right, top)
-2. Three corresponding images with specific objects highlighted in distinct colors from the same viewpoints
+1. Four images of a scene with original textures from different viewpoints (diagonal front left, diagonal front right, diagonal back left, diagonal back right)
+2. Four corresponding images with specific objects highlighted in distinct colors from the same viewpoints
 3. The prior from a previous semantic segmentation step for each highlighted object
 
 Focus ONLY on the highlighted objects. For each:
@@ -101,7 +101,7 @@ Focus ONLY on the highlighted objects. For each:
 ### Important rules to keep in mind
 1. A class cannot be its own superclass
 2. The prior semantic segmentation may be wrong. In such cases, please provide a correct semantic class name.
-3. Use all three viewpoints to get a complete understanding of each object's shape and context.
+3. Use all four viewpoints to get a complete understanding of each object's shape and context.
 
 ## Output Schema
 Respond with valid JSON:
@@ -129,17 +129,19 @@ Respond with valid JSON:
 
 ## Images
 
-Images 1-3: Original scene with natural textures from three viewpoints:
-  - Image 1: Top view
+Images 1-4: Original scene with natural textures from four viewpoints:
+  - Image 1: Diagonal front left view
   - Image 2: Diagonal front right view
-  - Image 3: Diagonal front left view
+  - Image 3: Diagonal back left view
+  - Image 4: Diagonal back right view
 
-Images 4-6: Same scene with target objects highlighted in distinct colors from the same viewpoints:
-  - Image 4: Top view (highlighted)
-  - Image 5: Diagonal front right view (highlighted)
-  - Image 6: Diagonal front left view (highlighted)
+Images 5-8: Same scene with target objects highlighted in distinct colors from the same viewpoints:
+  - Image 5: Diagonal front left view (highlighted)
+  - Image 6: Diagonal front right view (highlighted)
+  - Image 7: Diagonal back left view (highlighted)
+  - Image 8: Diagonal back right view (highlighted)
 
-Identify the highlighted objects using all viewpoints for a complete understanding.
+Identify the highlighted objects using all four viewpoints for a complete understanding.
 """
 
     # Build content array with text and all images
@@ -330,8 +332,8 @@ def main(args):
                 print(f"Processing {room_tag} ({len(bodies)} objects)")
                 print(f"{'='*60}")
 
-            # Render original scene from 3 viewpoints
-            print("Rendering original scene from 3 viewpoints...")
+            # Render original scene from 4 viewpoints
+            print("Rendering original scene from 4 viewpoints...")
             original_images = []
             for pose_name, camera_pose in camera_poses_dict.items():
                 print(f"  Rendering {pose_name} view...")
@@ -360,8 +362,8 @@ def main(args):
                     map(lambda c: c.closest_css3_color_name(), bodies_colors.values())
                 )
 
-                # Render highlighted scene from 3 viewpoints
-                print(f"  Rendering highlighted scene from 3 viewpoints...")
+                # Render highlighted scene from 4 viewpoints
+                print(f"  Rendering highlighted scene from 4 viewpoints...")
                 highlighted_images = []
                 for pose_name, camera_pose in camera_poses_dict.items():
                     image_bytes = batch_loader.render_scene_from_camera_pose(
@@ -431,8 +433,8 @@ def main(args):
                 print(f"Rendering {room_tag} ({len(bodies)} objects)")
                 print(f"{'='*60}")
 
-            # Render original scene from 3 viewpoints
-            print("Rendering original scene from 3 viewpoints...")
+            # Render original scene from 4 viewpoints
+            print("Rendering original scene from 4 viewpoints...")
             for pose_name, camera_pose in camera_poses_dict.items():
                 print(f"  Rendering {pose_name} view...")
                 batch_loader.render_scene_from_camera_pose(
@@ -458,8 +460,8 @@ def main(args):
                     map(lambda c: c.closest_css3_color_name(), bodies_colors.values())
                 )
 
-                # Render highlighted scene from 3 viewpoints
-                print(f"  Rendering highlighted scene from 3 viewpoints...")
+                # Render highlighted scene from 4 viewpoints
+                print(f"  Rendering highlighted scene from 4 viewpoints...")
                 for pose_name, camera_pose in camera_poses_dict.items():
                     batch_loader.render_scene_from_camera_pose(
                         camera_pose,

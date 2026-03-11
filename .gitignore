@@ -28,6 +28,7 @@ Thumbs.db
 datasets/
 model_input/
 model_output/
+test_output/
 
 # Environment / secrets
 .env
