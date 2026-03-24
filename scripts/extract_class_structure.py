@@ -250,10 +250,12 @@ def main(args):
                 "OPENROUTER_API_KEY environment variable is not set. Required for VLM queries."
             )
 
-    # Path for rendered images - save to scripts/model_input/
-    script_dir = Path(__file__).parent
-    model_input_dir = script_dir / "model_input"
-    model_input_dir.mkdir(parents=True, exist_ok=True)
+    # Base output directory for all artifacts (images, JSON, taxonomy)
+    if args.output_dir:
+        base_output_dir = Path(args.output_dir)
+    else:
+        base_output_dir = Path(__file__).parent / "model_input"
+    base_output_dir.mkdir(parents=True, exist_ok=True)
 
     # Create database engine and tables for later persistence of the world
     engine = create_engine(connection_string, echo=True)  # echo=True for debugging SQL
@@ -275,36 +277,31 @@ def main(args):
                 visual_glb_path = glb_files[0]
                 print(f"Using visual GLB: {visual_glb_path}")
 
+        # Always process room-by-room for HM3D.
+        # --num-rooms limits how many rooms to process (default: all).
+        all_room_ids = HM3DWorldLoader.discover_room_ids(obj_dir)
         if args.num_rooms is not None:
-            # Discover available rooms from the semantic TXT (no GLB parsing
-            # needed), then create a dedicated loader per room so each world
-            # contains only that room's meshes.
-            all_room_ids = HM3DWorldLoader.discover_room_ids(obj_dir)
             room_ids = all_room_ids[:args.num_rooms]
-            print(f"Will process {len(room_ids)} room(s): {room_ids} "
-                  f"(out of {len(all_room_ids)} total)")
-
-            room_batches = []
-            for rid in room_ids:
-                print(f"  Loading room {rid}...")
-                loader = HM3DWorldLoader(
-                    scene_dir=obj_dir, visual_glb_path=visual_glb_path,
-                    room_id=rid,
-                )
-                bodies = loader.object_bodies
-                poses = loader.compute_camera_poses()
-                room_batches.append((f"room{rid}", bodies, poses, loader))
-                print(f"  Room {rid}: {len(bodies)} objects")
-
-            # Use the first room's loader/world for export & DB persistence
-            world_loader = room_batches[0][3]
-            world = world_loader.world
         else:
-            world_loader = HM3DWorldLoader(scene_dir=obj_dir, visual_glb_path=visual_glb_path)
-            world = world_loader.world
-            bodies = world_loader.object_bodies
-            camera_poses_dict = world_loader.compute_camera_poses(bodies=bodies)
-            room_batches = [(None, bodies, camera_poses_dict, world_loader)]
+            room_ids = all_room_ids
+        print(f"Will process {len(room_ids)} room(s): {room_ids} "
+              f"(out of {len(all_room_ids)} total)")
+
+        room_batches = []
+        for rid in room_ids:
+            print(f"  Loading room {rid}...")
+            loader = HM3DWorldLoader(
+                scene_dir=obj_dir, visual_glb_path=visual_glb_path,
+                room_id=rid,
+            )
+            bodies = loader.object_bodies
+            poses = loader.compute_camera_poses()
+            room_batches.append((f"room{rid}", bodies, poses, loader))
+            print(f"  Room {rid}: {len(bodies)} objects")
+
+        # Use the first room's loader/world for export & DB persistence
+        world_loader = room_batches[0][3]
+        world = world_loader.world
     else:
         world_loader = WarsawWorldLoader(obj_dir)
         world = world_loader.world
@@ -313,6 +310,9 @@ def main(args):
         room_batches = [(None, bodies, camera_poses_dict, world_loader)]
 
     # Export semantic annotations JSON for VLM context
+    if args.output_dir and export_path == Path("./vlm_export"):
+        # Default export path: put taxonomy inside the output dir
+        export_path = base_output_dir / "taxonomy_export"
     world_loader.export_semantic_annotation_inheritance_structure(export_path)
 
     # Read taxonomy
@@ -323,9 +323,10 @@ def main(args):
         summary = []
 
         for room_tag, bodies, camera_poses_dict, batch_loader in room_batches:
-            room_prefix = f"{room_tag}_" if room_tag else ""
-            room_output_dir = model_input_dir / room_tag if room_tag else model_input_dir
-            room_output_dir.mkdir(parents=True, exist_ok=True)
+            room_folder = room_tag if room_tag else "all"
+            room_dir = base_output_dir / room_folder
+            image_dir = room_dir / "images"
+            image_dir.mkdir(parents=True, exist_ok=True)
 
             if room_tag:
                 print(f"\n{'='*60}")
@@ -339,7 +340,7 @@ def main(args):
                 print(f"  Rendering {pose_name} view...")
                 image_bytes = batch_loader.render_scene_from_camera_pose(
                     camera_pose,
-                    room_output_dir / f"scene_orig_{pose_name}.png",
+                    image_dir / f"scene_orig_{pose_name}.png",
                     headless=args.headless, use_visual_mesh=True,
                 )
                 original_images.append(image_bytes)
@@ -368,7 +369,7 @@ def main(args):
                 for pose_name, camera_pose in camera_poses_dict.items():
                     image_bytes = batch_loader.render_scene_from_camera_pose(
                         camera_pose,
-                        room_output_dir / f"scene_{i}_{pose_name}.png",
+                        image_dir / f"scene_{i}_{pose_name}.png",
                         headless=args.headless,
                     )
                     highlighted_images.append(image_bytes)
@@ -406,27 +407,40 @@ def main(args):
                 # Reset for next iteration
                 batch_loader._reset_body_colors()
 
+            # Save per-room VLM responses and summary
+            room_responses_file = room_dir / "vlm_responses.json"
+            with open(room_responses_file, "w") as f:
+                json.dump(room_responses, f, indent=2)
+            print(f"Room responses saved to {room_responses_file}")
+
+            room_summary = extract_summary(room_responses)
+            room_summary_file = room_dir / "vlm_summary.json"
+            with open(room_summary_file, "w") as f:
+                json.dump(room_summary, f, indent=2)
+            print(f"Room summary saved to {room_summary_file}")
+
             all_responses.extend(room_responses)
 
-        # Save raw responses
+        # Also save combined responses to the legacy output_file path
         with open(output_file, "w") as f:
             json.dump(all_responses, f, indent=2)
-        print(f"Raw results saved to {output_file}")
+        print(f"Combined raw results saved to {output_file}")
 
-        # Extract and save summary
         summary = extract_summary(all_responses)
         summary_file = output_file.parent / (output_file.stem + "_summary.json")
         with open(summary_file, "w") as f:
             json.dump(summary, f, indent=2)
-        print(f"Summary saved to {summary_file}")
+        print(f"Combined summary saved to {summary_file}")
 
     elif args.render_only:
         # Render-only mode: just save images without calling VLM
         print("Render-only mode: Saving images without VLM queries...")
 
         for room_tag, bodies, camera_poses_dict, batch_loader in room_batches:
-            room_output_dir = model_input_dir / room_tag if room_tag else model_input_dir
-            room_output_dir.mkdir(parents=True, exist_ok=True)
+            room_folder = room_tag if room_tag else "all"
+            room_dir = base_output_dir / room_folder
+            image_dir = room_dir / "images"
+            image_dir.mkdir(parents=True, exist_ok=True)
 
             if room_tag:
                 print(f"\n{'='*60}")
@@ -439,7 +453,7 @@ def main(args):
                 print(f"  Rendering {pose_name} view...")
                 batch_loader.render_scene_from_camera_pose(
                     camera_pose,
-                    room_output_dir / f"scene_orig_{pose_name}.png",
+                    image_dir / f"scene_orig_{pose_name}.png",
                     headless=args.headless, use_visual_mesh=True,
                 )
 
@@ -465,14 +479,14 @@ def main(args):
                 for pose_name, camera_pose in camera_poses_dict.items():
                     batch_loader.render_scene_from_camera_pose(
                         camera_pose,
-                        room_output_dir / f"scene_{i}_{pose_name}.png",
+                        image_dir / f"scene_{i}_{pose_name}.png",
                         headless=args.headless,
                     )
 
                 # Reset for next iteration
                 batch_loader._reset_body_colors()
 
-        print(f"All images saved to {model_input_dir}")
+        print(f"All images saved to {base_output_dir}")
         all_responses = []
         summary = []
 
@@ -518,6 +532,13 @@ if __name__ == "__main__":
         help="Directory for exported metadata",
     )
     parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Base output directory for all artifacts (images, JSON, taxonomy). "
+             "Per-room subdirectories are created automatically.",
+    )
+    parser.add_argument(
         "--group-size", type=int, default=8, help="Number of objects per group"
     )
     parser.add_argument(
@@ -542,8 +563,9 @@ if __name__ == "__main__":
         "--num-rooms",
         type=int,
         default=None,
-        help="HM3D only: process up to N rooms (each room separately). "
-             "If omitted, processes all objects as one batch.",
+        help="HM3D only: limit processing to the first N rooms. "
+             "If omitted, all rooms are processed. Each room is always "
+             "processed independently.",
     )
     args = parser.parse_args()
     main(args)

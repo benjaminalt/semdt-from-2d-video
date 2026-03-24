@@ -38,6 +38,7 @@ from semantic_digital_twin.semantic_annotations.in_memory_builder import (
 )
 from semantic_digital_twin.world_description.world_entity import (
     SemanticAnnotation,
+    RootedSemanticAnnotation,
     Body,
 )
 from semantic_digital_twin.utils import InheritanceStructureExporter
@@ -548,7 +549,7 @@ Respond with valid JSON:
                 kwargs = {}
 
                 # Handle body field
-                if issubclass(cls, HasRootBody) and annotation.body_id:
+                if issubclass(cls, RootedSemanticAnnotation) and annotation.body_id:
                     body = next(
                         (
                             b
