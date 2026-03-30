@@ -5,6 +5,7 @@ import requests
 import json
 import os
 import base64
+import time
 import numpy as np
 import trimesh
 
@@ -165,31 +166,59 @@ Identify the highlighted objects using all four viewpoints for a complete unders
             }
         )
 
-    response = requests.post(
-        url="https://openrouter.ai/api/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "ai.uni-bremen.de",
-            "X-Title": "Uni Bremen",
-        },
-        data=json.dumps(
-            {
-                "model": "qwen/qwen3-vl-30b-a3b-instruct",
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": system_prompt,
-                    },
-                    {
-                        "role": "user",
-                        "content": content,
-                    },
-                ],
-            }
-        ),
+    payload = json.dumps(
+        {
+            "model": "qwen/qwen3-vl-30b-a3b-instruct",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": system_prompt,
+                },
+                {
+                    "role": "user",
+                    "content": content,
+                },
+            ],
+        }
     )
-    return response.json()
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "ai.uni-bremen.de",
+        "X-Title": "Uni Bremen",
+    }
+
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(
+                url="https://openrouter.ai/api/v1/chat/completions",
+                headers=headers,
+                data=payload,
+                timeout=120,
+            )
+            response.raise_for_status()
+            return response.json()
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+                requests.exceptions.ChunkedEncodingError) as e:
+            if attempt < max_retries - 1:
+                wait = 2 ** attempt  # 1, 2, 4, 8, 16 seconds
+                print(f"  VLM request failed ({type(e).__name__}), retrying in {wait}s "
+                      f"(attempt {attempt + 1}/{max_retries})...")
+                time.sleep(wait)
+            else:
+                raise
+        except requests.exceptions.HTTPError as e:
+            status = response.status_code
+            # Retry on 429 (rate limit) and 5xx (server errors)
+            if status in (429, 500, 502, 503, 504) and attempt < max_retries - 1:
+                wait = 2 ** attempt
+                print(f"  VLM request returned {status}, retrying in {wait}s "
+                      f"(attempt {attempt + 1}/{max_retries})...")
+                time.sleep(wait)
+            else:
+                raise
 
 
 def extract_summary(all_responses: List[dict]) -> List[dict]:

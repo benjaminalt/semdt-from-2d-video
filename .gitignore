@@ -29,6 +29,7 @@ datasets/
 model_input/
 model_output/
 test_output/
+batch_output/
 
 # Environment / secrets
 .env

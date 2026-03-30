@@ -11,6 +11,9 @@ Output structure:
     batch_output/
       <scene_id>/
         taxonomy_export/
+        taxonomy_snapshot/
+          generated_classes.py      (scene-specific generated classes)
+          ormatic_interface.py      (scene-specific ORM)
         room<N>/                    (or "all/" when --num-rooms is not used)
           images/
             scene_orig_<pose>.png
@@ -25,7 +28,8 @@ Output structure:
 Usage:
     python scripts/run_batch.py                       # run all scenes
     python scripts/run_batch.py --scenes 00800 00803  # run specific scenes
-    python scripts/run_batch.py --resume              # resume from last state
+    python scripts/run_batch.py --resume              # resume from batch_state.json
+    python scripts/run_batch.py --continue-from batch_output/  # resume from disk state
     python scripts/run_batch.py --extract-only        # skip refinement
     python scripts/run_batch.py --dry-run             # show what would run
 """
@@ -34,6 +38,7 @@ import argparse
 import json
 import logging
 import re
+import shutil
 import subprocess
 import sys
 from datetime import datetime
@@ -51,6 +56,29 @@ SCRIPTS_DIR = REPO_ROOT / "scripts"
 DATASET_DIR = REPO_ROOT / "datasets" / "matterport3d"
 SEMANTIC_ANNOTS_DIR = DATASET_DIR / "hm3d-minival-semantic-annots-v0.2"
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "batch_output"
+
+CRAM_DIR = REPO_ROOT.parent / "cognitive_robot_abstract_machine"
+SDT_DIR = CRAM_DIR / "semantic_digital_twin" / "src" / "semantic_digital_twin"
+GENERATED_CLASSES_FILE = (
+    SDT_DIR / "semantic_annotations" / "generated_classes.py"
+)
+ORMATIC_INTERFACE_FILE = SDT_DIR / "orm" / "ormatic_interface.py"
+
+
+def save_taxonomy_snapshot(scene_out: Path):
+    """Copy generated_classes.py and ormatic_interface.py to the scene output.
+
+    This preserves the taxonomy state for this scene so that the persisted
+    DB world can be loaded later with all generated classes available.
+    """
+    taxonomy_dir = scene_out / "taxonomy_snapshot"
+    taxonomy_dir.mkdir(parents=True, exist_ok=True)
+
+    for src in (GENERATED_CLASSES_FILE, ORMATIC_INTERFACE_FILE):
+        if src.exists():
+            dst = taxonomy_dir / src.name
+            shutil.copy2(src, dst)
+            log.info("Saved %s -> %s", src.name, dst)
 
 
 def discover_scenes(base_dir: Path) -> list[str]:
@@ -87,19 +115,18 @@ def reset_taxonomy() -> bool:
         "--simple",
     ]
     log.info("Resetting taxonomy: %s", " ".join(cmd))
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, stdout=sys.stdout, stderr=subprocess.PIPE, text=True)
     if result.returncode != 0:
         log.error("Taxonomy reset failed:\nSTDERR: %s", result.stderr[-2000:])
         return False
 
     # Regenerate ORM
-    cram_dir = REPO_ROOT.parent / "cognitive_robot_abstract_machine"
-    generate_orm = cram_dir / "semantic_digital_twin" / "scripts" / "generate_orm.py"
+    generate_orm = CRAM_DIR / "semantic_digital_twin" / "scripts" / "generate_orm.py"
     if generate_orm.exists():
         log.info("Regenerating ORM...")
         result = subprocess.run(
             [sys.executable, str(generate_orm)],
-            capture_output=True, text=True,
+            stdout=sys.stdout, stderr=subprocess.PIPE, text=True,
         )
         if result.returncode != 0:
             log.error("ORM regeneration failed:\nSTDERR: %s", result.stderr[-2000:])
@@ -109,6 +136,89 @@ def reset_taxonomy() -> bool:
 
     log.info("Taxonomy reset complete")
     return True
+
+
+def reconstruct_state_from_disk(output_dir: Path) -> dict:
+    """Rebuild batch state by inspecting the filesystem.
+
+    Used by --continue-from when batch_state.json is missing or incomplete
+    (e.g. after a Ctrl-C).  For each scene directory found, checks:
+      - Whether rooms have vlm_summary.json  -> extract VLM queries completed
+      - Whether a combined vlm_responses file exists
+      - Whether rooms have instantiation_results.json -> refine completed
+    """
+    state: dict = {"scenes": {}}
+    if not output_dir.exists():
+        return state
+
+    for scene_dir in sorted(output_dir.iterdir()):
+        if not scene_dir.is_dir():
+            continue
+        scene_id = scene_dir.name
+        # Skip non-scene directories
+        if not scene_id.isdigit() and not scene_id[0].isdigit():
+            continue
+
+        scene_state: dict = {}
+
+        # Check rooms for extract output
+        room_dirs = []
+        for d in sorted(scene_dir.iterdir()):
+            if d.is_dir() and d.name not in ("taxonomy_export",):
+                if (d / "vlm_summary.json").exists():
+                    room_dirs.append(d)
+
+        if room_dirs:
+            scene_state["extract_vlm_done"] = True
+            # Check if DB persistence completed (combined file is written
+            # after VLM but before DB persist, so its presence is a hint
+            # but not proof of DB persist)
+            combined = scene_dir / "vlm_responses_combined.json"
+            scene_state["has_combined_json"] = combined.exists()
+
+            # Check per-room refine status
+            room_states = {}
+            for rd in room_dirs:
+                room_name = rd.name
+                if (rd / "instantiation_results.json").exists():
+                    room_states[room_name] = {"refine_status": "done"}
+                else:
+                    room_states[room_name] = {"refine_status": "pending"}
+            scene_state["rooms"] = room_states
+
+        state["scenes"][scene_id] = scene_state
+        log.info("Disk state for %s: vlm_done=%s, combined=%s, rooms=%s",
+                 scene_id,
+                 scene_state.get("extract_vlm_done", False),
+                 scene_state.get("has_combined_json", False),
+                 {k: v["refine_status"] for k, v in scene_state.get("rooms", {}).items()})
+
+    return state
+
+
+def reconstruct_combined_json(scene_out: Path) -> Path:
+    """Rebuild the combined vlm_responses JSON from per-room files.
+
+    Needed when extract was interrupted after writing per-room output
+    but before writing the combined file.
+    """
+    combined_path = scene_out / "vlm_responses_combined.json"
+    all_responses = []
+
+    for room_dir in sorted(scene_out.iterdir()):
+        if not room_dir.is_dir() or room_dir.name == "taxonomy_export":
+            continue
+        room_responses_file = room_dir / "vlm_responses.json"
+        if room_responses_file.exists():
+            with open(room_responses_file) as f:
+                all_responses.extend(json.load(f))
+
+    with open(combined_path, "w") as f:
+        json.dump(all_responses, f, indent=2)
+
+    log.info("Reconstructed combined JSON with %d groups at %s",
+             len(all_responses), combined_path)
+    return combined_path
 
 
 def discover_room_dirs(scene_out: Path) -> list[Path]:
@@ -145,16 +255,25 @@ def run_extract(
     ]
 
     log.info("Running: %s", " ".join(cmd))
-    result = subprocess.run(cmd, capture_output=True, text=True)
 
-    if result.returncode != 0:
-        log.error("Extract failed for %s:\nSTDOUT: %s\nSTDERR: %s",
-                  scene_dir.name, result.stdout[-2000:], result.stderr[-2000:])
+    # Stream stdout to terminal while capturing it to parse the database_id
+    captured_stdout = []
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, bufsize=1)
+    for line in proc.stdout:
+        print(line, end="", flush=True)
+        captured_stdout.append(line)
+    proc.wait()
+    stderr = proc.stderr.read()
+
+    if proc.returncode != 0:
+        log.error("Extract failed for %s:\nSTDERR: %s",
+                  scene_dir.name, stderr[-2000:])
         return False, None
 
     # Parse the database_id from stdout
     db_id = None
-    for line in result.stdout.splitlines():
+    for line in captured_stdout:
         m = re.search(r"World persisted with database_id:\s*(\d+)", line)
         if m:
             db_id = int(m.group(1))
@@ -183,15 +302,56 @@ def run_refine(
     ]
 
     log.info("Running: %s", " ".join(cmd))
-    result = subprocess.run(cmd, capture_output=True, text=True)
 
-    if result.returncode != 0:
-        log.error("Refine failed for %s:\nSTDOUT: %s\nSTDERR: %s",
-                  summary_json.parent.name, result.stdout[-2000:], result.stderr[-2000:])
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, bufsize=1)
+    for line in proc.stdout:
+        print(line, end="", flush=True)
+    proc.wait()
+    stderr = proc.stderr.read()
+
+    if proc.returncode != 0:
+        log.error("Refine failed for %s:\nSTDERR: %s",
+                  summary_json.parent.name, stderr[-2000:])
         return False
 
     log.info("Refine complete for %s (world_database_id=%d)",
              summary_json.parent.name, world_db_id)
+    return True
+
+
+def run_persist(
+    pending_jsons: list[Path],
+    world_db_id: int,
+    dataset: str = "hm3d",
+) -> bool:
+    """Run persist_annotations.py once with all pending annotation files.
+
+    This regenerates the ORM (once) and persists all annotations in a
+    single DB transaction.
+    """
+    cmd = [
+        sys.executable,
+        str(SCRIPTS_DIR / "persist_annotations.py"),
+        *[str(p) for p in pending_jsons],
+        "--world-db-id", str(world_db_id),
+        "--dataset", dataset,
+    ]
+
+    log.info("Running: %s", " ".join(cmd))
+
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, bufsize=1)
+    for line in proc.stdout:
+        print(line, end="", flush=True)
+    proc.wait()
+    stderr = proc.stderr.read()
+
+    if proc.returncode != 0:
+        log.error("Persist failed:\nSTDERR: %s", stderr[-2000:])
+        return False
+
+    log.info("Persist complete (world_database_id=%d)", world_db_id)
     return True
 
 
@@ -213,7 +373,16 @@ def main():
     parser.add_argument(
         "--resume",
         action="store_true",
-        help="Resume from saved state, skipping already-completed stages",
+        help="Resume from saved batch_state.json, skipping already-completed stages",
+    )
+    parser.add_argument(
+        "--continue-from",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help="Resume from a previous output directory by inspecting what exists "
+             "on disk. Unlike --resume, does not require batch_state.json. "
+             "Reconstructs state from per-room output files.",
     )
     parser.add_argument(
         "--extract-only",
@@ -277,7 +446,17 @@ def main():
 
     # State file for resumability
     state_file = args.output_dir / "batch_state.json"
-    state = load_state(state_file) if args.resume else {"scenes": {}}
+    if args.continue_from:
+        # Reconstruct state from disk, use that dir as output
+        args.output_dir = args.continue_from
+        state_file = args.output_dir / "batch_state.json"
+        state = reconstruct_state_from_disk(args.continue_from)
+        log.info("Reconstructed state from %s: %d scene(s)",
+                 args.continue_from, len(state["scenes"]))
+    elif args.resume:
+        state = load_state(state_file)
+    else:
+        state = {"scenes": {}}
 
     # Build extra args for extract
     extract_extra = ["--group-size", str(args.group_size)]
@@ -289,7 +468,9 @@ def main():
         extract_extra.extend(["--num-rooms", str(args.num_rooms)])
 
     # Build extra args for refine
-    refine_extra = []
+    # Always skip in-process persistence; we do one combined persist after
+    # all rooms finish to avoid regenerating the ORM per room.
+    refine_extra = ["--skip-persist"]
 
     results = {"total": len(scenes), "extracted": 0, "refined": 0, "failed": []}
 
@@ -313,16 +494,62 @@ def main():
             continue
 
         # --- Reset taxonomy for scene isolation ---
-        if not reset_taxonomy():
-            log.error("Failed to reset taxonomy before scene %s, skipping", scene_id)
-            results["failed"].append({"scene": scene_id, "stage": "reset"})
-            continue
+        # Skip reset in refine-only mode: the generated classes from extraction
+        # must remain in place so SQLAlchemy can load the persisted world.
+        if not args.refine_only:
+            if not reset_taxonomy():
+                log.error("Failed to reset taxonomy before scene %s, skipping", scene_id)
+                results["failed"].append({"scene": scene_id, "stage": "reset"})
+                continue
 
         # --- Extraction ---
         if not args.refine_only:
-            if args.resume and scene_state.get("extract_status") == "done":
+            already_done = (
+                (args.resume or args.continue_from)
+                and scene_state.get("extract_status") == "done"
+                and scene_state.get("database_id") is not None
+            )
+            vlm_done_but_no_db = (
+                args.continue_from
+                and scene_state.get("extract_vlm_done")
+                and scene_state.get("database_id") is None
+            )
+
+            if already_done:
                 log.info("Skipping extraction (already done, db_id=%s)",
                          scene_state.get("database_id"))
+            elif vlm_done_but_no_db:
+                # VLM output exists on disk but world was never persisted
+                # (e.g. Ctrl-C during DB write). Reconstruct combined JSON
+                # if needed, then re-run extract with --skip_vlm to persist.
+                log.info("VLM output exists for %s but no DB ID — "
+                         "re-running extract with --skip_vlm to persist world",
+                         scene_id)
+                if not scene_state.get("has_combined_json"):
+                    reconstruct_combined_json(scene_out)
+
+                replay_args = [
+                    a for a in extract_extra
+                    if a not in ("--skip_vlm", "--render-only")
+                ]
+                replay_args.append("--skip_vlm")
+                ok, db_id = run_extract(scene_dir, scene_out, replay_args)
+
+                scene_state["extract_status"] = "done" if ok else "failed"
+                scene_state["database_id"] = db_id
+                scene_state["extract_time"] = datetime.now().isoformat()
+                # Clear disk-only keys now that we have proper state
+                scene_state.pop("extract_vlm_done", None)
+                scene_state.pop("has_combined_json", None)
+
+                state["scenes"][scene_id] = scene_state
+                save_state(state_file, state)
+
+                if not ok:
+                    results["failed"].append({"scene": scene_id, "stage": "extract"})
+                    continue
+
+                results["extracted"] += 1
             else:
                 ok, db_id = run_extract(scene_dir, scene_out, extract_extra)
 
@@ -338,8 +565,16 @@ def main():
                     continue
 
                 results["extracted"] += 1
+
+            # Save taxonomy snapshot after extraction so --refine-only can
+            # restore it later without needing to re-run extraction.
+            save_taxonomy_snapshot(scene_out)
         else:
-            if scene_state.get("extract_status") != "done":
+            extract_done = (
+                scene_state.get("extract_status") == "done"
+                or scene_state.get("extract_vlm_done")
+            )
+            if not extract_done:
                 log.error("Cannot refine %s: extraction not completed", scene_id)
                 results["failed"].append(
                     {"scene": scene_id, "stage": "refine", "reason": "no extraction"})
@@ -369,7 +604,7 @@ def main():
                 room_name = room_dir.name
                 room_state = room_states.get(room_name, {})
 
-                if args.resume and room_state.get("refine_status") == "done":
+                if (args.resume or args.continue_from) and room_state.get("refine_status") == "done":
                     log.info("Skipping refinement for %s/%s (already done)",
                              scene_id, room_name)
                     continue
@@ -389,10 +624,36 @@ def main():
             state["scenes"][scene_id] = scene_state
             save_state(state_file, state)
 
-            if all_rooms_ok:
-                results["refined"] += 1
-            else:
+            if not all_rooms_ok:
                 results["failed"].append({"scene": scene_id, "stage": "refine"})
+                continue
+
+            # --- Combined persistence (once per scene, after all rooms) ---
+            # Collect pending_annotations.json from all rooms that succeeded
+            pending_jsons = []
+            for room_dir in room_dirs:
+                pa = room_dir / "pending_annotations.json"
+                if pa.exists():
+                    pending_jsons.append(pa)
+
+            if pending_jsons:
+                log.info("Persisting annotations from %d rooms for scene %s",
+                         len(pending_jsons), scene_id)
+                ok = run_persist(pending_jsons, db_id)
+                if ok:
+                    results["refined"] += 1
+                    scene_state["persist_status"] = "done"
+                else:
+                    results["failed"].append({"scene": scene_id, "stage": "persist"})
+                    scene_state["persist_status"] = "failed"
+                state["scenes"][scene_id] = scene_state
+                save_state(state_file, state)
+            else:
+                log.warning("No pending_annotations.json files found for %s", scene_id)
+
+            # Save the accumulated taxonomy (generated_classes.py + ORM)
+            # so this scene's DB world can be loaded independently later
+            save_taxonomy_snapshot(scene_out)
 
     # Final summary
     log.info("=" * 60)

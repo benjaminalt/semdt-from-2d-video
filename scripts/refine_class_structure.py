@@ -549,7 +549,7 @@ Respond with valid JSON:
                 kwargs = {}
 
                 # Handle body field
-                if issubclass(cls, RootedSemanticAnnotation) and annotation.body_id:
+                if issubclass(cls, (RootedSemanticAnnotation, HasRootBody)) and annotation.body_id:
                     body = next(
                         (
                             b
@@ -637,6 +637,45 @@ def load_generated_classes_module():
     return generated_module
 
 
+def _get_existing_dao_names() -> Set[str]:
+    """Return the set of DAO class names already defined in the ORM (before any generation).
+
+    This is used to detect name collisions when generating new SemanticAnnotation
+    classes whose ``<Name>DAO`` would shadow an existing DAO (e.g. geometry.Box → BoxDAO).
+    """
+    classes, _, _ = get_classes_of_ormatic_interface(ormatic_interface)
+    return {cls.__name__ + "DAO" for cls in classes}
+
+
+def _safe_class_name(proposed: str, existing_dao_names: Set[str]) -> str:
+    """Return *proposed* if its DAO name is free, otherwise disambiguate.
+
+    For example, if ``BoxDAO`` already exists for ``geometry.Box``, the
+    generated semantic-annotation class is renamed to ``HouseholdBox`` (and
+    further suffixed if that also collides).
+    """
+    if proposed + "DAO" not in existing_dao_names:
+        return proposed
+    # Try common disambiguation prefixes
+    for prefix in ("Household", "Semantic", "Annotated"):
+        candidate = prefix + proposed
+        if candidate + "DAO" not in existing_dao_names:
+            logging.warning(
+                f"Class name '{proposed}' collides with existing DAO "
+                f"'{proposed}DAO' — renamed to '{candidate}'"
+            )
+            return candidate
+    # Fallback: numeric suffix
+    for i in range(2, 100):
+        candidate = f"{proposed}{i}"
+        if candidate + "DAO" not in existing_dao_names:
+            logging.warning(
+                f"Class name '{proposed}' collides with existing DAO — renamed to '{candidate}'"
+            )
+            return candidate
+    raise RuntimeError(f"Could not find a non-colliding name for '{proposed}'")
+
+
 def build_class_lookup() -> Dict[str, Type]:
     """Build a name -> class lookup from the semantic_annotations module and generated_classes if it exists."""
     lookup = {}
@@ -716,6 +755,11 @@ def main(args):
     # Collect builders for new classes to write them all to a single file
     new_class_builders: List[SemanticAnnotationClassBuilder] = []
 
+    # Pre-compute existing DAO names so we can detect collisions when the VLM
+    # proposes a class name that already maps to a non-annotation DAO
+    # (e.g. geometry.Box → BoxDAO).
+    existing_dao_names = _get_existing_dao_names()
+
     for obj in summary:
         if obj.get("confidence", 0) < args.min_confidence:
             logging.warning(
@@ -728,6 +772,16 @@ def main(args):
 
         # Create class if it doesn't exist
         if cls_name not in class_lookup:
+            # Guard against DAO name collisions with existing (non-annotation) classes
+            safe_name = _safe_class_name(cls_name, existing_dao_names)
+            was_renamed = safe_name != cls_name
+            if was_renamed:
+                logging.info(
+                    f"Renamed '{cls_name}' → '{safe_name}' to avoid DAO collision"
+                )
+                original_name = cls_name
+                cls_name = safe_name
+
             logging.info(
                 f"Creating new class: {cls_name} (superclass: {superclass_name})"
             )
@@ -747,6 +801,12 @@ def main(args):
             )
             new_class_builders.append(builder)
             class_lookup[cls_name] = cls
+            # Also register under the original VLM name so subsequent summary
+            # entries with the same class name resolve without re-creation.
+            if was_renamed:
+                class_lookup[original_name] = cls
+            # Track the new DAO name so subsequent classes don't collide with it either
+            existing_dao_names.add(cls_name + "DAO")
             logging.info(f"Created class '{cls_name}'")
 
         # Create pending annotation
@@ -763,12 +823,104 @@ def main(args):
         )
 
     # Write new classes to the generated file, appending to any existing content
+    # and ensuring all superclass imports are present
     if new_class_builders:
         generated_file = Path(SemanticAnnotationFilePaths.GENERATED_CLASSES_FILE.value)
+
+        # Collect import requirements from new builders
+        from semantic_digital_twin.semantic_annotations.in_memory_builder import (
+            _MODULE_TO_IMPORT,
+        )
+        new_imports_by_source: Dict[str, set] = {}
         for builder in new_class_builders:
-            builder.append_to_file(generated_file)
+            for base in builder.bases:
+                key = SemanticAnnotationClassBuilder._get_import_key(base)
+                if key not in new_imports_by_source:
+                    new_imports_by_source[key] = set()
+                new_imports_by_source[key].add(base.__name__)
+
+        # Read existing file content and update imports
+        if generated_file.exists():
+            existing_content = generated_file.read_text()
+        else:
+            existing_content = ""
+
+        # Parse existing imports to merge with new ones
+        import re as _re
+        existing_lines = existing_content.split("\n")
+        non_import_lines = []
+        existing_imports_by_source: Dict[str, set] = {}
+        past_imports = False
+        for line in existing_lines:
+            # Skip boilerplate imports that we always regenerate
+            if line.startswith("from __future__") or line.startswith("from dataclasses"):
+                continue
+            m = _re.match(r"^from\s+(\S+)\s+import\s+(.+)$", line)
+            if m and not past_imports:
+                module_path = m.group(1)
+                names = {n.strip() for n in m.group(2).split(",")}
+                # Map back to source key
+                source_key = module_path
+                for key, template in _MODULE_TO_IMPORT.items():
+                    if key in module_path:
+                        source_key = key
+                        break
+                if source_key not in existing_imports_by_source:
+                    existing_imports_by_source[source_key] = set()
+                existing_imports_by_source[source_key].update(names)
+            elif line.strip() == "":
+                if past_imports:
+                    non_import_lines.append(line)
+            else:
+                past_imports = True
+                non_import_lines.append(line)
+
+        # Merge imports
+        merged_imports = {}
+        for source in set(list(existing_imports_by_source.keys()) + list(new_imports_by_source.keys())):
+            merged_imports[source] = (
+                existing_imports_by_source.get(source, set())
+                | new_imports_by_source.get(source, set())
+            )
+
+        # Build import lines
+        import_lines = [
+            "from __future__ import annotations",
+            "",
+            "from dataclasses import dataclass",
+            "",
+        ]
+        for source, class_names in sorted(merged_imports.items()):
+            sorted_names = ", ".join(sorted(class_names))
+            if source in _MODULE_TO_IMPORT:
+                import_lines.append(
+                    _MODULE_TO_IMPORT[source].format(classes=sorted_names)
+                )
+            else:
+                import_lines.append(f"from {source} import {sorted_names}")
+
+        # Render new class definitions
+        new_class_defs = []
+        for builder in new_class_builders:
+            new_class_defs.append(builder.render_source(include_imports=False))
+
+        # Combine existing class definitions with new ones
+        existing_class_text = "\n".join(non_import_lines).strip()
+        all_class_text = existing_class_text
+        if all_class_text and new_class_defs:
+            all_class_text += "\n\n"
+        all_class_text += "\n\n".join(new_class_defs)
+
+        # Write complete file
+        with open(str(generated_file), "w", encoding="utf-8") as f:
+            f.write("\n".join(import_lines))
+            f.write("\n\n")
+            f.write(all_class_text)
+            f.write("\n")
+
         logging.info(
-            f"Appended {len(new_class_builders)} new classes to {generated_file}"
+            f"Wrote {len(new_class_builders)} new classes to {generated_file} "
+            f"(with updated imports)"
         )
 
     logging.info(
@@ -843,121 +995,9 @@ def main(args):
         failed = sum(1 for r in instantiation_results if r["status"] == "failed")
         logging.info(f"Phase 3 complete: {created} created, {failed} failed")
 
-        # =====================================================================
-        # PHASE 4: Persistence - Add annotations to World and persist
-        # =====================================================================
-        if instances and not args.skip_persist:
-            logging.info("=" * 60)
-            logging.info("PHASE 4: Persistence")
-            logging.info("=" * 60)
-
-            # Regenerate ORM to include DAOs for any new SemanticAnnotation classes
-            logging.info(
-                "Regenerating ORM to include new SemanticAnnotation classes..."
-            )
-
-            # Create the new ormatic interface with updated classes
-            classes, alt_mappings, type_mappings = get_classes_of_ormatic_interface(
-                ormatic_interface
-            )
-
-            # Import classes from generated_classes.py if it exists
-            generated_module = load_generated_classes_module()
-            if generated_module:
-                for name in dir(generated_module):
-                    obj = getattr(generated_module, name)
-                    if (
-                        isinstance(obj, type)
-                        and issubclass(obj, SemanticAnnotation)
-                        and obj is not SemanticAnnotation
-                    ):
-                        if obj not in classes:
-                            classes.append(obj)
-                            logging.info(f"Added generated class to ORM: {name}")
-
-            # Add any new classes from class_lookup that aren't already included
-            classes += [cls for cls in class_lookup.values() if cls not in classes]
-
-            class_diagram = ClassDiagram(
-                list(sorted(classes, key=lambda c: c.__name__, reverse=True))
-            )
-            ormatic_instance = ORMatic(
-                class_diagram,
-                type_mappings=type_mappings,
-                alternative_mappings=alt_mappings,
-            )
-            ormatic_instance.make_all_tables()
-
-            # Write the regenerated ORM to file
-            orm_path = (
-                Path(__file__).parent.parent.parent
-                / "cognitive_robot_abstract_machine"
-                / "semantic_digital_twin"
-                / "src"
-                / "semantic_digital_twin"
-                / "orm"
-                / "ormatic_interface.py"
-            )
-            with open(orm_path, "w") as f:
-                ormatic_instance.to_sqlalchemy_file(f)
-            logging.info(f"ORM written to {orm_path}")
-
-            # Clear the lru_cache on DAO lookup functions
-            from krrood.ormatic.dao import get_dao_class, get_alternative_mapping
-
-            get_dao_class.cache_clear()
-            get_alternative_mapping.cache_clear()
-
-            # Ensure all classes referenced by the regenerated ORM are present
-            # on the generated_classes module before reloading
-            _gc_mod_name = "semantic_digital_twin.semantic_annotations.generated_classes"
-            _gc_mod = sys.modules.get(_gc_mod_name)
-            if _gc_mod is not None:
-                for _cls_name, _cls in class_lookup.items():
-                    if not hasattr(_gc_mod, _cls_name):
-                        setattr(_gc_mod, _cls_name, _cls)
-            # Also patch in_memory_builder for backward compat with older ORM files
-            import semantic_digital_twin.semantic_annotations.in_memory_builder as _imb
-            for _cls_name, _cls in class_lookup.items():
-                if not hasattr(_imb, _cls_name):
-                    setattr(_imb, _cls_name, _cls)
-
-            # Reload the ormatic_interface module to pick up new DAO classes
-            import importlib
-
-            importlib.reload(ormatic_interface)
-            logging.info("ORM module reloaded")
-
-            # Create any new tables in the database
-            from semantic_digital_twin.orm.ormatic_interface import Base as ReloadedBase
-
-            ReloadedBase.metadata.create_all(bind=engine)
-            logging.info("Database tables created/updated")
-
-            # Re-import to_dao after cache clear
-            from krrood.ormatic.dao import to_dao as fresh_to_dao
-
-            # Add all created semantic annotations to the world
-            with world.modify_world():
-                for instance in instances:
-                    world.add_semantic_annotation(instance)
-                    logging.info(f"Added {instance.__class__.__name__} to world")
-
-            logging.info(f"Added {len(instances)} semantic annotations to world")
-
-            # Persist the updated world back to the database
-            # Use merge() to update existing entry instead of creating a new one
-            with Session(engine) as session:
-                world_dao = fresh_to_dao(world)
-                # Preserve the original database_id to update instead of insert
-                world_dao.database_id = args.world_database_id
-                session.merge(world_dao)
-                session.commit()
-                logging.info(
-                    f"World with semantic annotations updated (database_id: {args.world_database_id})"
-                )
-
-            logging.info("Phase 4 complete")
+        # Persistence is handled externally (by run_batch.py or manually
+        # via persist_annotations.py) after all rooms have been processed,
+        # so the expensive ORM regeneration only happens once.
     else:
         logging.info("Dry run - skipping instantiation")
 
