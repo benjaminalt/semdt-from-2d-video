@@ -155,5 +155,44 @@ python scripts/refine_class_structure.py <summary.json> <world_database_id>
 
 ```bash
 python scripts/load_and_render_scene.py <world_name>
-python scripts/inspect_camera_pose.py <obj_dir>
+python scripts/utils/inspect_camera_pose.py <obj_dir>
 ```
+
+### Evaluation & Paper Figures
+
+Scripts in `scripts/paper_graphics/` for qualitative evaluation of pipeline results.
+
+**Compare ground truth vs predicted labels** (`compare_gt_vs_predicted.py`): Cross-references HM3D ground truth labels with VLM predictions from the batch output. Prints a color-coded terminal table with per-object accuracy, predicted superclasses, and a mismatch summary.
+
+```bash
+# Full comparison for scene 00800
+python scripts/paper_graphics/compare_gt_vs_predicted.py \
+    batch_output/00800 \
+    datasets/matterport3d/hm3d-minival-semantic-annots-v0.2/00800-TEEsavR23oF
+
+# Specific rooms, export to CSV
+python scripts/paper_graphics/compare_gt_vs_predicted.py \
+    batch_output/00800 \
+    datasets/matterport3d/hm3d-minival-semantic-annots-v0.2/00800-TEEsavR23oF \
+    --rooms 1 2 --csv comparison.csv
+```
+
+**Render annotated scene** (`render_annotated_scene.py`): Renders the scene from four viewpoints with objects colored by their predicted semantic class. Generates standalone legend images. Designed for publication-quality figures.
+
+```bash
+# Render with predicted coloring + ground truth side-by-side
+python scripts/paper_graphics/render_annotated_scene.py \
+    batch_output/00800 \
+    datasets/matterport3d/hm3d-minival-semantic-annots-v0.2/00800-TEEsavR23oF \
+    --headless --output-dir batch_output/00800/paper_renders \
+    --show-gt --render-gt
+
+# Custom resolution for paper
+python scripts/paper_graphics/render_annotated_scene.py \
+    batch_output/00800 \
+    datasets/matterport3d/hm3d-minival-semantic-annots-v0.2/00800-TEEsavR23oF \
+    --headless --output-dir paper_figures \
+    --resolution 1920 1080 --render-gt
+```
+
+Output per room: `original_*.png` (textured), `predicted_*.png` (class-colored), `gt_*.png` (ground truth-colored), `legend_predicted.png`, `legend_gt.png`.
