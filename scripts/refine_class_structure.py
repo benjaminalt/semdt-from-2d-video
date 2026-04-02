@@ -30,7 +30,7 @@ import requests
 
 from semantic_digital_twin.adapters.warsaw_world_loader import WarsawWorldLoader
 from semantic_digital_twin.semantic_annotations import semantic_annotations as sa_module
-from semantic_digital_twin.semantic_annotations.mixins import HasRootBody
+from semantic_digital_twin.semantic_annotations.mixins import HasRootKinematicStructureEntity
 from semantic_digital_twin.world import World
 from semantic_digital_twin.semantic_annotations.in_memory_builder import (
     SemanticAnnotationClassBuilder,
@@ -548,8 +548,10 @@ Respond with valid JSON:
             try:
                 kwargs = {}
 
-                # Handle body field
-                if issubclass(cls, (RootedSemanticAnnotation, HasRootBody)) and annotation.body_id:
+                # Handle body field — use HasRootKinematicStructureEntity
+                # which is the common base for HasRootBody, HasRootRegion,
+                # HasDoors, etc., all of which define root: KinematicStructureEntity.
+                if issubclass(cls, HasRootKinematicStructureEntity) and annotation.body_id:
                     body = next(
                         (
                             b
@@ -645,6 +647,32 @@ def _get_existing_dao_names() -> Set[str]:
     """
     classes, _, _ = get_classes_of_ormatic_interface(ormatic_interface)
     return {cls.__name__ + "DAO" for cls in classes}
+
+
+def _to_pascal_case(name: str) -> str:
+    """Convert an arbitrary string to a valid PascalCase Python identifier.
+
+    Handles spaces, hyphens, underscores, and leading digits.
+    E.g. ``"LED Television"`` -> ``"LEDTelevision"``,
+         ``"floor-mat"`` -> ``FloorMat``,
+         ``"3d_printer"`` -> ``_3dPrinter``.
+    """
+    import re as _re
+    # Split on non-alphanumeric characters
+    parts = _re.split(r"[^a-zA-Z0-9]+", name)
+    # Capitalize each part, but preserve fully-uppercase parts (acronyms)
+    result = ""
+    for part in parts:
+        if not part:
+            continue
+        if part.isupper():
+            result += part
+        else:
+            result += part[0].upper() + part[1:]
+    # Ensure valid identifier (can't start with digit)
+    if result and result[0].isdigit():
+        result = "_" + result
+    return result or "UnknownClass"
 
 
 def _safe_class_name(proposed: str, existing_dao_names: Set[str]) -> str:
@@ -767,8 +795,8 @@ def main(args):
             )
             continue
 
-        cls_name = obj["class"]
-        superclass_name = obj.get("superclass", "SemanticAnnotation")
+        cls_name = _to_pascal_case(obj["class"])
+        superclass_name = _to_pascal_case(obj.get("superclass", "SemanticAnnotation"))
 
         # Create class if it doesn't exist
         if cls_name not in class_lookup:
@@ -882,6 +910,22 @@ def main(args):
                 existing_imports_by_source.get(source, set())
                 | new_imports_by_source.get(source, set())
             )
+
+        # Remove locally-defined classes from imports: if a class is defined
+        # in generated_classes.py itself, importing it from another module
+        # will either fail (it doesn't exist there) or shadow the local def.
+        import re as _re_local
+        local_class_names = set()
+        for line in non_import_lines:
+            m = _re_local.match(r"^class\s+(\w+)", line)
+            if m:
+                local_class_names.add(m.group(1))
+        for builder in new_class_builders:
+            local_class_names.add(builder.name)
+        for source in list(merged_imports):
+            merged_imports[source] -= local_class_names
+            if not merged_imports[source]:
+                del merged_imports[source]
 
         # Build import lines
         import_lines = [

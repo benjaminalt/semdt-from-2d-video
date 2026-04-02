@@ -33,4 +33,5 @@ batch_output/
 
 # Environment / secrets
 .env
+env.sh
 cram-env

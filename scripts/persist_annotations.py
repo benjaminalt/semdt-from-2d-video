@@ -21,9 +21,18 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 from dataclasses import is_dataclass
 from pathlib import Path
+
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
+
+
+def _is_uuid(value: str) -> bool:
+    return bool(_UUID_RE.match(value))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -272,6 +281,109 @@ def build_class_lookup():
     return lookup
 
 
+def persist_one_room(
+    pending: list[dict],
+    world_db_id: int,
+    class_lookup: dict,
+    engine,
+    room_label: str = "",
+) -> bool:
+    """Load one room's world, instantiate annotations, and persist."""
+    tag = f" [{room_label}]" if room_label else ""
+
+    logging.info("%sLoading world from database (id=%d)...", tag, world_db_id)
+    with Session(engine) as session:
+        queried_dao = session.scalar(
+            select(WorldMappingDAO).where(
+                WorldMappingDAO.database_id == world_db_id
+            )
+        )
+        if queried_dao is None:
+            logging.error(
+                "%sNo world found with database_id %d", tag, world_db_id
+            )
+            return False
+        world = queried_dao.from_dao()
+    logging.info("%sWorld loaded successfully", tag)
+
+    body_map = {str(b.id): b for b in world.bodies}
+    logging.info("%sWorld has %d bodies", tag, len(body_map))
+
+    # Instantiate annotations
+    instances = []
+    skipped = 0
+    for ann in pending:
+        cls_name = ann["class"]
+        body_id = ann.get("body_id")
+
+        cls = class_lookup.get(cls_name)
+        if cls is None:
+            logging.warning("%sClass %s not found in lookup, skipping", tag, cls_name)
+            skipped += 1
+            continue
+
+        try:
+            kwargs = {}
+            if issubclass(cls, (RootedSemanticAnnotation, HasRootBody)) and body_id:
+                body = body_map.get(body_id)
+                if body:
+                    kwargs["root"] = body
+                else:
+                    skipped += 1
+                    continue
+
+            # Handle field assignments, resolving UUID strings to Body objects
+            skip = False
+            for field_name, value in ann.get("field_assignments", {}).items():
+                if isinstance(value, str) and value in body_map:
+                    kwargs[field_name] = body_map[value]
+                elif isinstance(value, str) and _is_uuid(value):
+                    logging.warning(
+                        "%sUnresolvable body ref %s.%s = %s, skipping",
+                        tag, cls_name, field_name, value,
+                    )
+                    skip = True
+                    break
+                else:
+                    kwargs[field_name] = value
+            if skip:
+                skipped += 1
+                continue
+
+            instance = cls(**kwargs)
+            instances.append(instance)
+        except Exception as e:
+            logging.error("%sFailed to create %s: %s", tag, cls_name, e)
+            skipped += 1
+
+    logging.info(
+        "%sInstantiated %d annotations (%d skipped)", tag, len(instances), skipped
+    )
+
+    if not instances:
+        logging.warning("%sNo annotations to persist", tag)
+        return True
+
+    with world.modify_world():
+        for instance in instances:
+            world.add_semantic_annotation(instance)
+
+    logging.info("%sAdded %d semantic annotations to world", tag, len(instances))
+
+    logging.info("%sPersisting to database...", tag)
+    with Session(engine) as session:
+        world_dao = to_dao(world)
+        world_dao.database_id = world_db_id
+        session.merge(world_dao)
+        session.commit()
+        logging.info(
+            "%sWorld updated (database_id: %d)", tag, world_db_id
+        )
+
+    logging.info("%sPersistence complete", tag)
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Persist semantic annotations to the database"
@@ -282,11 +394,18 @@ def main():
         nargs="+",
         help="Path(s) to pending_annotations.json files",
     )
-    parser.add_argument(
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument(
         "--world-db-id",
         type=int,
-        required=True,
-        help="DB ID of the world",
+        help="DB ID of the world (when all files share one world)",
+    )
+    group.add_argument(
+        "--room-db-ids",
+        type=Path,
+        help="Path to room_db_ids.json mapping room names to DB IDs. "
+             "Each pending_annotations file is matched to its room by "
+             "its parent directory name.",
     )
     parser.add_argument(
         "--dataset",
@@ -294,16 +413,6 @@ def main():
         default="warsaw",
     )
     args = parser.parse_args()
-
-    # Load and combine pending annotations from all files
-    pending = []
-    for json_path in args.pending_annotations_json:
-        with open(json_path) as f:
-            entries = json.load(f)
-        logging.info("Loaded %d annotations from %s", len(entries), json_path.name)
-        pending.extend(entries)
-
-    logging.info("Total pending annotations: %d", len(pending))
 
     # Build class lookup
     class_lookup = build_class_lookup()
@@ -340,86 +449,39 @@ def main():
 
     Base.metadata.create_all(bind=engine)
 
-    # Load the world from DB
-    logging.info("Loading world from database (id=%d)...", args.world_db_id)
-    with Session(engine) as session:
-        queried_dao = session.scalar(
-            select(WorldMappingDAO).where(
-                WorldMappingDAO.database_id == args.world_db_id
-            )
-        )
-        if queried_dao is None:
-            logging.error(
-                "No world found with database_id %d", args.world_db_id
-            )
-            sys.exit(1)
-        world = queried_dao.from_dao()
-    logging.info("World loaded successfully")
+    # Load room_db_ids mapping if provided
+    if args.room_db_ids:
+        with open(args.room_db_ids) as f:
+            room_db_ids = json.load(f)
+    else:
+        room_db_ids = None
 
-    # Build body lookup
-    body_map = {str(b.id): b for b in world.bodies}
-    logging.info("World has %d bodies", len(body_map))
+    # Group annotations by room and persist each room against its own world
+    failed = False
+    for json_path in args.pending_annotations_json:
+        with open(json_path) as f:
+            pending = json.load(f)
 
-    # Instantiate annotations
-    instances = []
-    skipped = 0
-    for ann in pending:
-        cls_name = ann["class"]
-        body_id = ann.get("body_id")
+        room_name = json_path.parent.name
+        logging.info("Loaded %d annotations from %s", len(pending), json_path)
 
-        cls = class_lookup.get(cls_name)
-        if cls is None:
-            logging.warning("Class %s not found in lookup, skipping", cls_name)
-            skipped += 1
-            continue
+        if room_db_ids is not None:
+            world_db_id = room_db_ids.get(room_name)
+            if world_db_id is None:
+                logging.error(
+                    "No DB ID for room %s in %s", room_name, args.room_db_ids
+                )
+                failed = True
+                continue
+        else:
+            world_db_id = args.world_db_id
 
-        try:
-            kwargs = {}
-            if issubclass(cls, (RootedSemanticAnnotation, HasRootBody)) and body_id:
-                body = body_map.get(body_id)
-                if body:
-                    kwargs["root"] = body
-                else:
-                    skipped += 1
-                    continue
+        ok = persist_one_room(pending, world_db_id, class_lookup, engine, room_name)
+        if not ok:
+            failed = True
 
-            # Handle field assignments (if any)
-            for field_name, value in ann.get("field_assignments", {}).items():
-                kwargs[field_name] = value
-
-            instance = cls(**kwargs)
-            instances.append(instance)
-        except Exception as e:
-            logging.error("Failed to create %s: %s", cls_name, e)
-            skipped += 1
-
-    logging.info(
-        "Instantiated %d annotations (%d skipped)", len(instances), skipped
-    )
-
-    if not instances:
-        logging.warning("No annotations to persist")
-        sys.exit(0)
-
-    # Add annotations to the world
-    with world.modify_world():
-        for instance in instances:
-            world.add_semantic_annotation(instance)
-
-    logging.info("Added %d semantic annotations to world", len(instances))
-
-    # Persist
-    logging.info("Persisting to database...")
-    with Session(engine) as session:
-        world_dao = to_dao(world)
-        world_dao.database_id = args.world_db_id
-        session.merge(world_dao)
-        session.commit()
-        logging.info(
-            "World updated (database_id: %d)", args.world_db_id
-        )
-
-    logging.info("Persistence complete")
+    if failed:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

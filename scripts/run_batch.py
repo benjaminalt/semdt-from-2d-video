@@ -9,27 +9,30 @@ and resumability via a persistent state file.
 
 Output structure:
     batch_output/
-      <scene_id>/
-        taxonomy_export/
-        taxonomy_snapshot/
-          generated_classes.py      (scene-specific generated classes)
-          ormatic_interface.py      (scene-specific ORM)
-        room<N>/                    (or "all/" when --num-rooms is not used)
-          images/
-            scene_orig_<pose>.png
-            scene_<group>_<pose>.png
-          vlm_responses.json
-          vlm_summary.json
-          resolution_log.json       (from refine)
-          pending_annotations.json  (from refine)
-          instantiation_results.json
-      batch_state.json
+      <YYYY-MM-DD_HHMMSS>/           (timestamped experiment directory)
+        experiment_metadata.json
+        batch_state.json
+        batch_results.json
+        <scene_id>/
+          taxonomy_export/
+          taxonomy_snapshot/
+            generated_classes.py      (scene-specific generated classes)
+            ormatic_interface.py      (scene-specific ORM)
+          room<N>/                    (or "all/" when --num-rooms is not used)
+            images/
+              scene_orig_<pose>.png
+              scene_<group>_<pose>.png
+            vlm_responses.json
+            vlm_summary.json
+            resolution_log.json       (from refine)
+            pending_annotations.json  (from refine)
+            instantiation_results.json
 
 Usage:
     python scripts/run_batch.py                       # run all scenes
     python scripts/run_batch.py --scenes 00800 00803  # run specific scenes
-    python scripts/run_batch.py --resume              # resume from batch_state.json
-    python scripts/run_batch.py --continue-from batch_output/  # resume from disk state
+    python scripts/run_batch.py --resume              # resume latest experiment
+    python scripts/run_batch.py --continue-from batch_output/2026-03-30_174927/
     python scripts/run_batch.py --extract-only        # skip refinement
     python scripts/run_batch.py --dry-run             # show what would run
 """
@@ -65,6 +68,81 @@ GENERATED_CLASSES_FILE = (
 ORMATIC_INTERFACE_FILE = SDT_DIR / "orm" / "ormatic_interface.py"
 
 
+def get_git_commit(repo_dir: Path) -> str:
+    """Return the current HEAD commit hash for a git repo, or 'unknown'."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_dir), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return "unknown"
+
+
+def get_git_dirty(repo_dir: Path) -> bool:
+    """Return True if the working tree has uncommitted changes."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_dir), "status", "--porcelain"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            return bool(result.stdout.strip())
+    except Exception:
+        pass
+    return False
+
+
+def write_experiment_metadata(output_dir: Path, args) -> None:
+    """Write a metadata JSON documenting the experiment configuration."""
+    metadata = {
+        "timestamp": datetime.now().isoformat(),
+        "repos": {
+            "semdt_from_2d_video": {
+                "path": str(REPO_ROOT),
+                "commit": get_git_commit(REPO_ROOT),
+                "dirty": get_git_dirty(REPO_ROOT),
+            },
+            "cognitive_robot_abstract_machine": {
+                "path": str(CRAM_DIR),
+                "commit": get_git_commit(CRAM_DIR),
+                "dirty": get_git_dirty(CRAM_DIR),
+            },
+        },
+        "models": {
+            "vlm": {
+                "model_id": "qwen/qwen3-vl-30b-a3b-instruct",
+                "provider": "openrouter",
+                "used_in": "extract_class_structure.py",
+            },
+            "llm": {
+                "model_id": "meta-llama/llama-3.3-70b-instruct",
+                "provider": "openrouter",
+                "used_in": "refine_class_structure.py (dependency resolution)",
+            },
+        },
+        "command_line": sys.argv,
+        "args": {
+            "scenes": args.scenes,
+            "group_size": args.group_size,
+            "num_rooms": args.num_rooms,
+            "extract_only": args.extract_only,
+            "refine_only": args.refine_only,
+            "skip_vlm": args.skip_vlm,
+            "render_only": args.render_only,
+            "no_prior_labels": getattr(args, "no_prior_labels", False),
+        },
+    }
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    metadata_file = output_dir / "experiment_metadata.json"
+    metadata_file.write_text(json.dumps(metadata, indent=2))
+    log.info("Experiment metadata saved to %s", metadata_file)
+
+
 def save_taxonomy_snapshot(scene_out: Path):
     """Copy generated_classes.py and ormatic_interface.py to the scene output.
 
@@ -79,6 +157,27 @@ def save_taxonomy_snapshot(scene_out: Path):
             dst = taxonomy_dir / src.name
             shutil.copy2(src, dst)
             log.info("Saved %s -> %s", src.name, dst)
+
+
+def find_latest_experiment_dir(base_dir: Path) -> Path | None:
+    """Find the most recent timestamped experiment directory under base_dir."""
+    if not base_dir.exists():
+        return None
+    candidates = sorted(
+        (d for d in base_dir.iterdir()
+         if d.is_dir() and re.match(r"\d{4}-\d{2}-\d{2}_\d{6}", d.name)),
+        key=lambda d: d.name,
+        reverse=True,
+    )
+    return candidates[0] if candidates else None
+
+
+def create_experiment_dir(base_dir: Path) -> Path:
+    """Create a new timestamped experiment directory under base_dir."""
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    experiment_dir = base_dir / timestamp
+    experiment_dir.mkdir(parents=True, exist_ok=True)
+    return experiment_dir
 
 
 def discover_scenes(base_dir: Path) -> list[str]:
@@ -176,6 +275,13 @@ def reconstruct_state_from_disk(output_dir: Path) -> dict:
             combined = scene_dir / "vlm_responses_combined.json"
             scene_state["has_combined_json"] = combined.exists()
 
+            # Read per-room DB IDs if available
+            room_db_ids_file = scene_dir / "room_db_ids.json"
+            if room_db_ids_file.exists():
+                with open(room_db_ids_file) as f:
+                    scene_state["room_db_ids"] = json.load(f)
+                scene_state["extract_status"] = "done"
+
             # Check per-room refine status
             room_states = {}
             for rd in room_dirs:
@@ -234,10 +340,10 @@ def run_extract(
     scene_dir: Path,
     scene_out: Path,
     extra_args: list[str],
-) -> tuple[bool, int | None]:
+) -> tuple[bool, dict[str, int] | None]:
     """
     Run extract_class_structure.py for one scene.
-    Returns (success, world_database_id).
+    Returns (success, room_db_ids mapping {room_tag: database_id}).
     """
     # The combined output file goes at the scene level;
     # per-room files are written by extract into room subdirs.
@@ -256,13 +362,11 @@ def run_extract(
 
     log.info("Running: %s", " ".join(cmd))
 
-    # Stream stdout to terminal while capturing it to parse the database_id
-    captured_stdout = []
+    # Stream stdout to terminal while capturing it
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             text=True, bufsize=1)
     for line in proc.stdout:
         print(line, end="", flush=True)
-        captured_stdout.append(line)
     proc.wait()
     stderr = proc.stderr.read()
 
@@ -271,19 +375,17 @@ def run_extract(
                   scene_dir.name, stderr[-2000:])
         return False, None
 
-    # Parse the database_id from stdout
-    db_id = None
-    for line in captured_stdout:
-        m = re.search(r"World persisted with database_id:\s*(\d+)", line)
-        if m:
-            db_id = int(m.group(1))
-            break
+    # Read per-room database IDs from the mapping file written by extract
+    room_db_ids_file = scene_out / "room_db_ids.json"
+    room_db_ids = None
+    if room_db_ids_file.exists():
+        with open(room_db_ids_file) as f:
+            room_db_ids = json.load(f)
+        log.info("Extract complete for %s (room_db_ids=%s)", scene_dir.name, room_db_ids)
+    else:
+        log.warning("No room_db_ids.json found for %s", scene_dir.name)
 
-    if db_id is None:
-        log.warning("Could not parse database_id from extract output for %s", scene_dir.name)
-
-    log.info("Extract complete for %s (database_id=%s)", scene_dir.name, db_id)
-    return True, db_id
+    return True, room_db_ids
 
 
 def run_refine(
@@ -322,19 +424,19 @@ def run_refine(
 
 def run_persist(
     pending_jsons: list[Path],
-    world_db_id: int,
+    room_db_ids_file: Path,
     dataset: str = "hm3d",
 ) -> bool:
     """Run persist_annotations.py once with all pending annotation files.
 
-    This regenerates the ORM (once) and persists all annotations in a
-    single DB transaction.
+    Uses --room-db-ids so each room's annotations are persisted against
+    the correct world, while ORM regeneration happens only once.
     """
     cmd = [
         sys.executable,
         str(SCRIPTS_DIR / "persist_annotations.py"),
         *[str(p) for p in pending_jsons],
-        "--world-db-id", str(world_db_id),
+        "--room-db-ids", str(room_db_ids_file),
         "--dataset", dataset,
     ]
 
@@ -351,7 +453,7 @@ def run_persist(
         log.error("Persist failed:\nSTDERR: %s", stderr[-2000:])
         return False
 
-    log.info("Persist complete (world_database_id=%d)", world_db_id)
+    log.info("Persist complete")
     return True
 
 
@@ -421,6 +523,11 @@ def main():
         default=None,
         help="Pass --num-rooms N to extract (HM3D room batching)",
     )
+    parser.add_argument(
+        "--no-prior-labels",
+        action="store_true",
+        help="Pass --no-prior-labels to extract (don't leak GT labels to VLM)",
+    )
     args = parser.parse_args()
 
     # Discover scenes
@@ -444,19 +551,34 @@ def main():
 
     log.info("Scenes to process: %s", scenes)
 
-    # State file for resumability
-    state_file = args.output_dir / "batch_state.json"
+    # Determine experiment directory
+    base_output_dir = args.output_dir
     if args.continue_from:
-        # Reconstruct state from disk, use that dir as output
-        args.output_dir = args.continue_from
-        state_file = args.output_dir / "batch_state.json"
-        state = reconstruct_state_from_disk(args.continue_from)
+        # Use the specified directory directly as the experiment dir
+        experiment_dir = args.continue_from
+        state = reconstruct_state_from_disk(experiment_dir)
         log.info("Reconstructed state from %s: %d scene(s)",
-                 args.continue_from, len(state["scenes"]))
+                 experiment_dir, len(state["scenes"]))
     elif args.resume:
-        state = load_state(state_file)
+        # Find the latest timestamped experiment dir
+        experiment_dir = find_latest_experiment_dir(base_output_dir)
+        if experiment_dir is None:
+            log.error("No experiment directory found under %s to resume",
+                      base_output_dir)
+            sys.exit(1)
+        log.info("Resuming from %s", experiment_dir)
+        state = load_state(experiment_dir / "batch_state.json")
     else:
+        # Create a new timestamped experiment dir
+        experiment_dir = create_experiment_dir(base_output_dir)
         state = {"scenes": {}}
+
+    state_file = experiment_dir / "batch_state.json"
+    log.info("Experiment directory: %s", experiment_dir)
+
+    # Write experiment metadata before any processing
+    if not args.dry_run:
+        write_experiment_metadata(experiment_dir, args)
 
     # Build extra args for extract
     extract_extra = ["--group-size", str(args.group_size)]
@@ -466,6 +588,8 @@ def main():
         extract_extra.append("--render-only")
     if args.num_rooms is not None:
         extract_extra.extend(["--num-rooms", str(args.num_rooms)])
+    if args.no_prior_labels:
+        extract_extra.append("--no-prior-labels")
 
     # Build extra args for refine
     # Always skip in-process persistence; we do one combined persist after
@@ -477,7 +601,7 @@ def main():
     for scene_name in scenes:
         scene_dir = SEMANTIC_ANNOTS_DIR / scene_name
         scene_id = scene_name.split("-")[0]  # e.g. "00800"
-        scene_out = args.output_dir / scene_id
+        scene_out = experiment_dir / scene_id
         scene_out.mkdir(parents=True, exist_ok=True)
 
         scene_state = state["scenes"].get(scene_id, {})
@@ -507,17 +631,17 @@ def main():
             already_done = (
                 (args.resume or args.continue_from)
                 and scene_state.get("extract_status") == "done"
-                and scene_state.get("database_id") is not None
+                and scene_state.get("room_db_ids") is not None
             )
             vlm_done_but_no_db = (
                 args.continue_from
                 and scene_state.get("extract_vlm_done")
-                and scene_state.get("database_id") is None
+                and scene_state.get("room_db_ids") is None
             )
 
             if already_done:
-                log.info("Skipping extraction (already done, db_id=%s)",
-                         scene_state.get("database_id"))
+                log.info("Skipping extraction (already done, room_db_ids=%s)",
+                         scene_state.get("room_db_ids"))
             elif vlm_done_but_no_db:
                 # VLM output exists on disk but world was never persisted
                 # (e.g. Ctrl-C during DB write). Reconstruct combined JSON
@@ -533,10 +657,10 @@ def main():
                     if a not in ("--skip_vlm", "--render-only")
                 ]
                 replay_args.append("--skip_vlm")
-                ok, db_id = run_extract(scene_dir, scene_out, replay_args)
+                ok, room_db_ids = run_extract(scene_dir, scene_out, replay_args)
 
                 scene_state["extract_status"] = "done" if ok else "failed"
-                scene_state["database_id"] = db_id
+                scene_state["room_db_ids"] = room_db_ids
                 scene_state["extract_time"] = datetime.now().isoformat()
                 # Clear disk-only keys now that we have proper state
                 scene_state.pop("extract_vlm_done", None)
@@ -551,10 +675,10 @@ def main():
 
                 results["extracted"] += 1
             else:
-                ok, db_id = run_extract(scene_dir, scene_out, extract_extra)
+                ok, room_db_ids = run_extract(scene_dir, scene_out, extract_extra)
 
                 scene_state["extract_status"] = "done" if ok else "failed"
-                scene_state["database_id"] = db_id
+                scene_state["room_db_ids"] = room_db_ids
                 scene_state["extract_time"] = datetime.now().isoformat()
 
                 state["scenes"][scene_id] = scene_state
@@ -582,9 +706,9 @@ def main():
 
         # --- Refinement (per room) ---
         if not args.extract_only:
-            db_id = scene_state.get("database_id")
-            if db_id is None:
-                log.error("No database_id for scene %s, cannot refine", scene_id)
+            room_db_ids = scene_state.get("room_db_ids")
+            if not room_db_ids:
+                log.error("No room_db_ids for scene %s, cannot refine", scene_id)
                 results["failed"].append(
                     {"scene": scene_id, "stage": "refine", "reason": "no db_id"})
                 continue
@@ -609,8 +733,24 @@ def main():
                              scene_id, room_name)
                     continue
 
+                # Look up the per-room DB ID; fall back to first available if
+                # the mapping uses a single entry (e.g. Warsaw / single-room).
+                room_db_id = room_db_ids.get(room_name)
+                if room_db_id is None:
+                    # Fallback: if only one world was persisted (e.g. "all"),
+                    # use that for every room.
+                    if len(room_db_ids) == 1:
+                        room_db_id = next(iter(room_db_ids.values()))
+                    else:
+                        log.error("No database_id for %s/%s (available: %s)",
+                                  scene_id, room_name, list(room_db_ids.keys()))
+                        room_state["refine_status"] = "failed"
+                        room_states[room_name] = room_state
+                        all_rooms_ok = False
+                        continue
+
                 summary_json = room_dir / "vlm_summary.json"
-                ok = run_refine(summary_json, db_id, refine_extra)
+                ok = run_refine(summary_json, room_db_id, refine_extra)
 
                 room_state["refine_status"] = "done" if ok else "failed"
                 room_state["refine_time"] = datetime.now().isoformat()
@@ -628,7 +768,7 @@ def main():
                 results["failed"].append({"scene": scene_id, "stage": "refine"})
                 continue
 
-            # --- Combined persistence (once per scene, after all rooms) ---
+            # --- Persistence (single process, per-room worlds) ---
             # Collect pending_annotations.json from all rooms that succeeded
             pending_jsons = []
             for room_dir in room_dirs:
@@ -636,10 +776,12 @@ def main():
                 if pa.exists():
                     pending_jsons.append(pa)
 
-            if pending_jsons:
+            room_db_ids_file = scene_out / "room_db_ids.json"
+
+            if pending_jsons and room_db_ids_file.exists():
                 log.info("Persisting annotations from %d rooms for scene %s",
                          len(pending_jsons), scene_id)
-                ok = run_persist(pending_jsons, db_id)
+                ok = run_persist(pending_jsons, room_db_ids_file)
                 if ok:
                     results["refined"] += 1
                     scene_state["persist_status"] = "done"
@@ -667,7 +809,7 @@ def main():
 
     # Save final results
     if not args.dry_run:
-        results_file = args.output_dir / "batch_results.json"
+        results_file = experiment_dir / "batch_results.json"
         results_file.write_text(json.dumps(results, indent=2))
         log.info("Results saved to %s", results_file)
 

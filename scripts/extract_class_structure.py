@@ -328,7 +328,7 @@ def main(args):
             room_batches.append((f"room{rid}", bodies, poses, loader))
             print(f"  Room {rid}: {len(bodies)} objects")
 
-        # Use the first room's loader/world for export & DB persistence
+        # Use the first room's loader for taxonomy export
         world_loader = room_batches[0][3]
         world = world_loader.world
     else:
@@ -410,7 +410,10 @@ def main(args):
                 semantic_labels = ""
                 for body_uuid, color_name in semantic_labels_dict.items():
                     body = next(filter(lambda b: b.id == body_uuid, bodies))
-                    semantic_labels += f"{color_name}: {body.name}\n"
+                    if args.no_prior_labels:
+                        semantic_labels += f"{color_name}: (no prior label)\n"
+                    else:
+                        semantic_labels += f"{color_name}: {body.name}\n"
 
                 # Query VLM
                 print(f"  Querying VLM for group {i + 1}...")
@@ -530,12 +533,35 @@ def main(args):
             json.dump(summary, f, indent=2)
         print(f"Summary saved to {summary_file}")
 
-    # Convert world to DAO and persist
+    # Convert world(s) to DAO and persist
+    # For HM3D room-by-room processing, each room has its own World with
+    # unique body UUIDs.  Persist every room's world so that the refinement
+    # step can find the bodies referenced in each room's VLM summary.
+    room_db_ids: Dict[str, int] = {}
+
     with Session(engine) as session:
-        world_dao: WorldMappingDAO = to_dao(world)
-        session.add(world_dao)
-        session.commit()
-        print(f"World persisted with database_id: {world_dao.database_id}")
+        if args.dataset == "hm3d" and len(room_batches) > 1:
+            for room_tag, _bodies, _poses, room_loader in room_batches:
+                room_world = room_loader.world
+                room_dao: WorldMappingDAO = to_dao(room_world)
+                session.add(room_dao)
+                session.flush()  # get the database_id
+                room_db_ids[room_tag] = room_dao.database_id
+                print(f"Room {room_tag} persisted with database_id: {room_dao.database_id}")
+            session.commit()
+        else:
+            world_dao: WorldMappingDAO = to_dao(world)
+            session.add(world_dao)
+            session.commit()
+            room_tag = room_batches[0][0] if room_batches[0][0] else "all"
+            room_db_ids[room_tag] = world_dao.database_id
+            print(f"World persisted with database_id: {world_dao.database_id}")
+
+    # Write room → database_id mapping for the batch runner
+    room_db_ids_file = base_output_dir / "room_db_ids.json"
+    with open(room_db_ids_file, "w") as f:
+        json.dump(room_db_ids, f, indent=2)
+    print(f"Room DB IDs saved to {room_db_ids_file}")
 
     return all_responses, summary
 
@@ -587,6 +613,13 @@ if __name__ == "__main__":
         action="store_true",
         default=False,
         help="Use offscreen rendering (no display required)",
+    )
+    parser.add_argument(
+        "--no-prior-labels",
+        action="store_true",
+        default=False,
+        help="Do not send HM3D ground truth body names as prior semantic labels "
+             "to the VLM. Use this for unbiased evaluation.",
     )
     parser.add_argument(
         "--num-rooms",
