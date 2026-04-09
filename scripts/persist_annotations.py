@@ -55,6 +55,9 @@ from semantic_digital_twin.world_description.world_entity import (
     RootedSemanticAnnotation,
     Body,
 )
+from semantic_digital_twin.semantic_annotations.mixins import (
+    HasRootKinematicStructureEntity,
+)
 
 
 def _preload_generated_classes():
@@ -236,7 +239,6 @@ regenerate_orm()
 # ---------------------------------------------------------------------------
 from semantic_digital_twin.orm.ormatic_interface import WorldMappingDAO, Base
 from semantic_digital_twin.semantic_annotations import semantic_annotations as sa_module
-from semantic_digital_twin.semantic_annotations.mixins import HasRootBody
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -309,52 +311,113 @@ def persist_one_room(
     body_map = {str(b.id): b for b in world.bodies}
     logging.info("%sWorld has %d bodies", tag, len(body_map))
 
-    # Instantiate annotations
-    instances = []
-    skipped = 0
-    for ann in pending:
+    # Instantiate annotations.  Field assignments may contain UUIDs
+    # that reference other annotations (not just bodies), so we
+    # iterate until all resolvable annotations are instantiated.
+    ann_by_id = {ann["id"]: ann for ann in pending}
+    instance_by_id: dict[str, SemanticAnnotation] = {}
+    skipped_ids: set[str] = set()
+
+    def _try_instantiate(ann: dict) -> SemanticAnnotation | None:
+        """Try to instantiate one annotation.  Returns None if a
+        dependency is not yet available (will be retried)."""
         cls_name = ann["class"]
         body_id = ann.get("body_id")
 
         cls = class_lookup.get(cls_name)
         if cls is None:
             logging.warning("%sClass %s not found in lookup, skipping", tag, cls_name)
-            skipped += 1
-            continue
+            skipped_ids.add(ann["id"])
+            return None
 
-        try:
-            kwargs = {}
-            if issubclass(cls, (RootedSemanticAnnotation, HasRootBody)) and body_id:
-                body = body_map.get(body_id)
-                if body:
-                    kwargs["root"] = body
-                else:
-                    skipped += 1
-                    continue
+        kwargs = {}
+        needs_root = issubclass(
+            cls, (RootedSemanticAnnotation, HasRootKinematicStructureEntity)
+        )
+        if needs_root and body_id:
+            body = body_map.get(body_id)
+            if body:
+                kwargs["root"] = body
+            else:
+                skipped_ids.add(ann["id"])
+                return None
+        elif needs_root and not body_id:
+            logging.warning(
+                "%s%s needs root but no body_id provided, skipping",
+                tag, cls_name,
+            )
+            skipped_ids.add(ann["id"])
+            return None
 
-            # Handle field assignments, resolving UUID strings to Body objects
-            skip = False
-            for field_name, value in ann.get("field_assignments", {}).items():
-                if isinstance(value, str) and value in body_map:
-                    kwargs[field_name] = body_map[value]
-                elif isinstance(value, str) and _is_uuid(value):
+        # Resolve field assignments: UUIDs can reference bodies or
+        # previously instantiated annotations.
+        for field_name, value in ann.get("field_assignments", {}).items():
+            if isinstance(value, str) and value in body_map:
+                kwargs[field_name] = body_map[value]
+            elif isinstance(value, str) and value in instance_by_id:
+                kwargs[field_name] = instance_by_id[value]
+            elif isinstance(value, str) and _is_uuid(value):
+                if value in skipped_ids:
                     logging.warning(
-                        "%sUnresolvable body ref %s.%s = %s, skipping",
+                        "%sField %s.%s references skipped annotation %s, skipping",
                         tag, cls_name, field_name, value,
                     )
-                    skip = True
-                    break
-                else:
-                    kwargs[field_name] = value
-            if skip:
-                skipped += 1
-                continue
+                    skipped_ids.add(ann["id"])
+                    return None
+                # Dependency not yet instantiated — retry later
+                return None
+            else:
+                kwargs[field_name] = value
 
-            instance = cls(**kwargs)
-            instances.append(instance)
-        except Exception as e:
-            logging.error("%sFailed to create %s: %s", tag, cls_name, e)
-            skipped += 1
+        # SemanticAnnotation.__post_init__ accesses self._world
+        # (via self.kinematic_structure_entities), but _world is
+        # init=False and only set later by add_to_world().  Inject
+        # it before __init__ so __post_init__ doesn't crash.
+        instance = cls.__new__(cls)
+        object.__setattr__(instance, "_world", world)
+        instance.__init__(**kwargs)
+        return instance
+
+    # Iterate until no more progress (handles dependency ordering)
+    remaining = list(ann_by_id.keys())
+    max_passes = len(remaining) + 1
+    for pass_num in range(max_passes):
+        next_remaining = []
+        progress = False
+        for ann_id in remaining:
+            if ann_id in skipped_ids or ann_id in instance_by_id:
+                continue
+            try:
+                instance = _try_instantiate(ann_by_id[ann_id])
+            except Exception as e:
+                logging.error(
+                    "%sFailed to create %s: %s",
+                    tag, ann_by_id[ann_id]["class"], e,
+                )
+                skipped_ids.add(ann_id)
+                continue
+            if instance is not None:
+                instance_by_id[ann_id] = instance
+                progress = True
+            else:
+                if ann_id not in skipped_ids:
+                    next_remaining.append(ann_id)
+        remaining = next_remaining
+        if not remaining or not progress:
+            break
+
+    # Anything still remaining has unresolvable dependencies
+    for ann_id in remaining:
+        if ann_id not in skipped_ids:
+            ann = ann_by_id[ann_id]
+            logging.warning(
+                "%sUnresolvable dependencies for %s (id=%s), skipping",
+                tag, ann["class"], ann_id,
+            )
+            skipped_ids.add(ann_id)
+
+    instances = list(instance_by_id.values())
+    skipped = len(skipped_ids)
 
     logging.info(
         "%sInstantiated %d annotations (%d skipped)", tag, len(instances), skipped

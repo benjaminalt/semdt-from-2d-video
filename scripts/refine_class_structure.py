@@ -837,6 +837,13 @@ def main(args):
             existing_dao_names.add(cls_name + "DAO")
             logging.info(f"Created class '{cls_name}'")
 
+        # Resolve cls_name to the actual generated class name.  When a
+        # DAO collision caused a rename (e.g. Box → HouseholdBox), the
+        # original VLM name is registered in class_lookup as an alias.
+        # Use the real class __name__ so pending_annotations.json always
+        # references the name that exists in generated_classes.py.
+        cls_name = class_lookup[cls_name].__name__
+
         # Create pending annotation
         pending_ann = PendingAnnotation(
             id=str(uuid4()),
